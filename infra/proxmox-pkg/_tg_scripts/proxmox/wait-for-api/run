@@ -1,0 +1,92 @@
+#!/bin/bash
+# Wait for all configured Proxmox API endpoints to become reachable on port 8006.
+# Called by the null/proxmox/wait-for-proxmox Terragrunt unit via local-exec.
+#
+# Usage:
+#   ./run --build      Wait for Proxmox API endpoints
+#   ./run --help       Show this help
+#
+# Environment:
+#   _PROXMOX_WAIT_TIMEOUT  Timeout (seconds). 0=skip, -1=block indefinitely, N=poll (default: 300)
+
+set -euo pipefail
+function handle_error {
+    local exit_status=$?
+    echo "An error occurred on line $LINENO: $BASH_COMMAND"
+    exit $exit_status
+}
+trap handle_error ERR
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+. "$GIT_ROOT/set_env.sh"
+. "$_UTILITIES_DIR/bash/init.sh"
+. "$_UTILITIES_DIR/bash/framework-utils.sh"
+
+STACK_CONFIG="$(_find_component_config proxmox-pkg)"
+
+# Returns 0 when all configured Proxmox endpoints respond on port 8006.
+_proxmox_all_up() {
+    local endpoints api_port=8006
+    endpoints=$(python3 -c "
+import yaml, re
+with open('$STACK_CONFIG') as f:
+    cfg = yaml.safe_load(f)
+cp = cfg['proxmox-pkg']['providers']['proxmox']['config_params']
+for k, v in cp.items():
+    if re.search(r'/pve-nodes/pve-\d+\$', k) and v and v.get('ansible_host'):
+        print(v['ansible_host'])
+" 2>/dev/null) || true
+    [[ -z "$endpoints" ]] && return 0
+    while IFS= read -r host; do
+        [[ -z "$host" ]] && continue
+        nc -z -w3 "$host" "$api_port" 2>/dev/null || return 1
+    done <<< "$endpoints"
+}
+
+function show_usage() {
+    printf "Usage: $0 <command>\n"
+    cat <<EOF
+    -b|--build      Wait for all Proxmox API endpoints to become reachable
+    -h|--help       Show this help
+
+    Environment:
+      _PROXMOX_WAIT_TIMEOUT  0=skip, -1=block forever, N=poll for N seconds (default: 300)
+EOF
+    exit 1
+}
+
+if [[ $# -lt 1 ]]; then show_usage "$@"; fi
+
+function build() {
+    local endpoints
+    endpoints=$(python3 -c "
+import yaml, re
+with open('$STACK_CONFIG') as f:
+    cfg = yaml.safe_load(f)
+cp = cfg['proxmox-pkg']['providers']['proxmox']['config_params']
+for k, v in cp.items():
+    if re.search(r'/pve-nodes/pve-\d+\$', k) and v and v.get('ansible_host'):
+        print(v['ansible_host'])
+" 2>/dev/null) || true
+    if [[ -z "$endpoints" ]]; then
+        echo "  [skip] No Proxmox pve-node endpoints found in config."
+        return 0
+    fi
+    echo "  Proxmox endpoints: $(echo "$endpoints" | tr '\n' ' ')"
+    echo "  If reinstalling Proxmox, set _PROXMOX_WAIT_TIMEOUT=-1 to wait for Enter."
+    if ! wait_for_condition \
+        "Proxmox API endpoints reachable on port 8006" \
+        "_proxmox_all_up" \
+        _PROXMOX_WAIT_TIMEOUT 300 15; then
+        echo "ERROR: Proxmox API endpoints did not become reachable within the configured timeout."
+        exit 1
+    fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -b|--build) shift; build ;;
+    -h|--help)  show_usage ;;
+    *)          shift ;;
+  esac
+done

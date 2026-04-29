@@ -1,0 +1,21 @@
+---
+# Wave test: verify all Packer-built test VMs (role_test_vm_packer) are accessible via
+# SSH after vms.proxmox.from-packer wave completes. VMs are cloned from Packer templates
+# and boot with cloud-init + qemu-guest-agent.
+- name: Verify Packer test VMs accessible via SSH
+  hosts: test_vm_packer
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH connection (allow time for cloud-init to complete)
+      ansible.builtin.wait_for_connection:
+        timeout: 180
+
+    - name: Gather system facts via SSH
+      ansible.builtin.gather_facts:
+
+    - name: Report SSH result
+      ansible.builtin.debug:
+        msg: >-
+          PASS: {{ inventory_hostname }} SSH OK
+          ({{ ansible_distribution }} {{ ansible_distribution_version }},
+          {{ ansible_default_ipv4.address | default(ansible_host) }})

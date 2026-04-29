@@ -1,0 +1,26 @@
+---
+# Install Proxmox VE 9 on hosts tagged role_proxmox_server in the Ansible inventory.
+#
+# Pre-conditions:
+#   - MaaS has deployed Debian 13 (trixie) to the target host.
+#     Set deploy_distro: trixie in pwy-home-lab-pkg.yaml for the machine unit.
+#   - Host is reachable via SSH as the debian user (or cloud_init_user from YAML).
+#   - Internet access available from the host (Proxmox packages downloaded via apt).
+#
+# Reference: https://pve.proxmox.com/wiki/Install_Proxmox_VE_on_Debian_Trixie
+#
+# Run with: ./run --build
+
+- name: Install Proxmox VE 9 on Debian 13 (proxmox_server hosts)
+  hosts: proxmox_server
+  gather_facts: true
+  become: true
+  tasks:
+    - ansible.builtin.include_tasks: tasks/install-proxmox-packages.yaml
+
+- name: Verify Proxmox VE installation
+  hosts: proxmox_server
+  gather_facts: false
+  become: true
+  tasks:
+    - ansible.builtin.include_tasks: tasks/verify-proxmox.yaml

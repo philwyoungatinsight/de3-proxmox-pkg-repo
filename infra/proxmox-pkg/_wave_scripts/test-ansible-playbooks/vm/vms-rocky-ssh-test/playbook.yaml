@@ -1,0 +1,20 @@
+---
+# Wave test: verify all Rocky Linux test VMs (role_test_vm_rocky) are accessible via
+# SSH after vms.proxmox.from-web.rocky wave completes. VMs boot with cloud-init + qemu-guest-agent.
+- name: Verify Rocky Linux test VMs accessible via SSH
+  hosts: test_vm_rocky
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH connection (allow time for cloud-init to complete)
+      ansible.builtin.wait_for_connection:
+        timeout: 180
+
+    - name: Gather system facts via SSH
+      ansible.builtin.gather_facts:
+
+    - name: Report SSH result
+      ansible.builtin.debug:
+        msg: >-
+          PASS: {{ inventory_hostname }} SSH OK
+          ({{ ansible_distribution }} {{ ansible_distribution_version }},
+          {{ ansible_default_ipv4.address | default(ansible_host) }})

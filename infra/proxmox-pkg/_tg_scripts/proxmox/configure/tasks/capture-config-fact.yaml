@@ -1,0 +1,17 @@
+---
+# Capture the proxmox node config as a fact for downstream plays.
+#
+# Input variables (set by config_base role on localhost):
+#   stack_config (dict) - full lab stack YAML config.
+#
+# Output (set on localhost):
+#   pve_host_config (dict) - all proxmox config_params entries, keyed by config path.
+#                            Derived from providers.proxmox.config_params pve-node entries.
+#
+# Note: per-host vars (pve_node, pve_bridge_technology, pve_vlan_bridge) are
+# already injected into host vars by generate_ansible_inventory.py (pve_hosts group).
+# This task exists for downstream plays that need the full config dict.
+
+- name: Capture proxmox config_params as fact for downstream plays
+  ansible.builtin.set_fact:
+    pve_host_config: "{{ _tg_providers.proxmox.config_params | default({}) }}"

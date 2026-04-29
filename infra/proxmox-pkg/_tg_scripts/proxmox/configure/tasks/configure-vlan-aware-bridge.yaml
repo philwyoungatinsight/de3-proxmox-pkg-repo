@@ -1,0 +1,99 @@
+---
+# Configure a VLAN-aware Linux bridge on a Proxmox host via the Proxmox API.
+#
+# A VLAN-aware bridge enables kernel-level VLAN filtering, allowing VMs to use
+# tagged VLAN NICs (network_vlan_id in Proxmox) over a single bridge+physical NIC.
+# This is required for:
+#   - VMs attached to non-default VLANs (e.g. provisioning VLAN 12 for PXE)
+#   - Physical machines PXE-booting via the switch trunking VLAN 12 to this host
+#
+# Input variables (from inventory host vars, set by generate_ansible_inventory pve_hosts group):
+#   inventory_hostname    (str) - host name for display.
+#   pve_node              (str) - Proxmox node name (e.g. "pve", "pve2").
+#   pve_vlan_bridge       (str) - bridge interface to enable VLAN-awareness on
+#                                 (e.g. "vmbr0").
+#
+# Effect:
+#   Sets bridge_vlan_aware=1 on pve_vlan_bridge via the Proxmox network API and
+#   applies the change (equivalent to "Apply Configuration" in the Proxmox UI).
+#   Uses ifreload -a under the hood; SSH will briefly disconnect (~5s).
+#
+#   NOTE: Gateway configuration has been removed from this task. Gateway assignment
+#   is now handled exclusively by _configure-bridge-host-ip.yaml (called from
+#   configure-bridges.yaml step 5). This task purely enables VLAN filtering.
+#
+# Idempotent: checks both the Proxmox API state (desired config) and the kernel
+#   state (active config). Only applies if the two are out of sync or unset.
+
+- name: Get current bridge config from Proxmox API
+  ansible.builtin.command: >
+    pvesh get /nodes/{{ pve_node }}/network/{{ pve_vlan_bridge }}
+    --output-format json
+  register: _bridge_config_raw
+  changed_when: false
+
+- name: Parse current bridge config
+  ansible.builtin.set_fact:
+    _bridge_config: "{{ _bridge_config_raw.stdout | from_json }}"
+  when: _bridge_config_raw.stdout is defined  # Guard: skip if host was unreachable
+
+- name: Read kernel VLAN filtering state
+  ansible.builtin.command: >
+    cat /sys/class/net/{{ pve_vlan_bridge }}/bridge/vlan_filtering
+  register: _kernel_vlan_filtering
+  changed_when: false
+  failed_when: false  # Bridge may exist in pvesh config but not yet in kernel
+
+- name: Determine bridge configuration state
+  ansible.builtin.set_fact:
+    _api_vlan_aware: "{{ _bridge_config.get('bridge_vlan_aware', False) | bool }}"
+    _kernel_vlan_active: "{{ _kernel_vlan_filtering.rc == 0 and _kernel_vlan_filtering.stdout | trim == '1' }}"
+  when: _bridge_config is defined
+
+# Set bridge VLAN-aware if not yet enabled.
+- name: Set bridge-vlan-aware via Proxmox API (stages pending change)
+  ansible.builtin.command: >
+    pvesh set /nodes/{{ pve_node }}/network/{{ pve_vlan_bridge }}
+    --type bridge
+    --bridge_vlan_aware 1
+  when: _api_vlan_aware is defined and not _api_vlan_aware
+  register: _vlan_aware_set
+
+# Apply if either: we just staged the API config, OR the API is already configured
+# but the kernel does not yet reflect it (pending change from a previous run).
+# "pvesh set /nodes/{node}/network" reloads the config (equivalent to the Proxmox
+# UI "Apply Configuration" button). It returns a UPID; the actual reload is async
+# on the server but SSH is NOT dropped — the management bridge stays up.
+- name: Apply pending network config via Proxmox reload
+  ansible.builtin.command: pvesh set /nodes/{{ pve_node }}/network
+  when: >
+    _api_vlan_aware is defined and _kernel_vlan_active is defined and
+    (_vlan_aware_set.changed or (_api_vlan_aware and not _kernel_vlan_active))
+  changed_when: true
+  register: _apply_job
+
+- name: Wait for network reload to complete (Proxmox runs ifreload async)
+  ansible.builtin.pause:
+    seconds: 5
+  when: _apply_job is defined and _apply_job.changed
+
+- name: Verify kernel VLAN filtering is active on {{ pve_vlan_bridge }}
+  ansible.builtin.command: >
+    cat /sys/class/net/{{ pve_vlan_bridge }}/bridge/vlan_filtering
+  register: _vlan_filtering_final
+  changed_when: false
+  failed_when: "_vlan_filtering_final.rc != 0 or _vlan_filtering_final.stdout | trim != '1'"
+  retries: 6
+  delay: 5
+  until: "_vlan_filtering_final.rc == 0 and _vlan_filtering_final.stdout | trim == '1'"
+
+- name: Report bridge configuration
+  ansible.builtin.debug:
+    msg: |
+      Host      : {{ inventory_hostname }} (node={{ pve_node }})
+      Bridge    : {{ pve_vlan_bridge }}
+      API state : bridge_vlan_aware={{ _api_vlan_aware }}
+      Was active: {{ _kernel_vlan_active }}
+      Result    : {{ _kernel_vlan_active | ternary('already active (no change)', 'VLAN-aware applied now') }}
+      Kernel vlan_filtering: {{ _vlan_filtering_final.stdout | trim }}
+  when: _api_vlan_aware is defined and _kernel_vlan_active is defined and _vlan_filtering_final.stdout is defined

@@ -1,0 +1,165 @@
+---
+# Assign a host IP address to a bridge interface on a Proxmox host.
+#
+# Handles two cases:
+#   Case A — host_vlan is set (int): IP lives on a VLAN subinterface
+#             (e.g. vmbr0.10). Gateway is placed on the PARENT bridge.
+#   Case B — host_vlan is null/absent: IP is assigned directly to the bridge
+#             (or OVS internal port). Gateway goes on the same interface.
+#
+# Input variables:
+#   _bridge (dict) - bridge descriptor from pve_bridges list:
+#     name      (str)      - Bridge interface name (e.g. "vmbr0", "vmbr1").
+#     host_ip   (str)      - IP to assign (e.g. "10.0.10.115"). Required (non-empty).
+#     host_vlan (int|null) - VLAN tag for subinterface; null = direct on bridge.
+#     gateway   (str)      - Gateway IP. "" = do not set/change.
+#     comment   (str)      - Free-text comment.
+#   pve_node (str) - Proxmox node name (always available as host var).
+#
+# Idempotent: checks current config via pvesh before making changes.
+
+# ── Case A: VLAN subinterface ─────────────────────────────────────────────────
+
+- name: "Case A — Configure VLAN subinterface {{ _bridge.name }}.{{ _bridge.host_vlan }}"
+  when:
+    - _bridge.host_vlan is defined
+    - _bridge.host_vlan is not none
+  block:
+
+    - name: "Check if {{ _bridge.name }}.{{ _bridge.host_vlan }} already exists"
+      ansible.builtin.command: >
+        pvesh get /nodes/{{ pve_node }}/network/{{ _bridge.name }}.{{ _bridge.host_vlan }}
+        --output-format json
+      register: _vlan_iface_check
+      failed_when: false
+      changed_when: false
+
+    - name: "{{ _bridge.name }}.{{ _bridge.host_vlan }} already configured — skip creation"
+      ansible.builtin.debug:
+        msg: >
+          {{ _bridge.name }}.{{ _bridge.host_vlan }} already configured on {{ pve_node }}
+          with IP {{ _bridge.host_ip }}. Skipping VLAN subinterface creation.
+      when: _vlan_iface_check.rc == 0
+
+    - name: "Create VLAN subinterface {{ _bridge.name }}.{{ _bridge.host_vlan }} (cidr={{ _bridge.host_ip }}/24)"
+      ansible.builtin.command: >
+        pvesh create /nodes/{{ pve_node }}/network
+        --iface {{ _bridge.name }}.{{ _bridge.host_vlan }}
+        --type vlan
+        --vlan-raw-device {{ _bridge.name }}
+        --tag {{ _bridge.host_vlan }}
+        --cidr {{ _bridge.host_ip }}/24
+        --autostart 1
+        --comments "{{ _bridge.comment | default('VLAN ' + (_bridge.host_vlan | string) + ' host IP') }}"
+      register: _vlan_iface_create
+      when: _vlan_iface_check.rc != 0
+
+    # Gateway goes on the PARENT bridge (not the VLAN subinterface).
+    - name: "Set gateway {{ _bridge.gateway }} on parent bridge {{ _bridge.name }}"
+      ansible.builtin.command: >
+        pvesh set /nodes/{{ pve_node }}/network/{{ _bridge.name }}
+        --type bridge
+        --gateway {{ _bridge.gateway }}
+      when:
+        - _vlan_iface_check.rc != 0
+        - _bridge.gateway | default('') != ''
+
+    # Apply the pending config. ifreload -a brings up the VLAN subinterface
+    # without dropping SSH on the management bridge.
+    - name: "Apply pending network config (bring up {{ _bridge.name }}.{{ _bridge.host_vlan }})"
+      ansible.builtin.command: pvesh set /nodes/{{ pve_node }}/network
+      when: _vlan_iface_create is defined and _vlan_iface_create.changed
+      changed_when: true
+
+    - name: Wait for network reload (ifreload -a is async)
+      ansible.builtin.pause:
+        seconds: 5
+      when: _vlan_iface_create is defined and _vlan_iface_create.changed
+
+    - name: "Verify {{ _bridge.name }}.{{ _bridge.host_vlan }} is up in kernel"
+      ansible.builtin.command: "ip addr show {{ _bridge.name }}.{{ _bridge.host_vlan }}"
+      register: _vlan_iface_state
+      changed_when: false
+      failed_when: >-
+        _vlan_iface_state.rc != 0 or _bridge.host_ip not in _vlan_iface_state.stdout
+      retries: 6
+      delay: 5
+      until: >-
+        _vlan_iface_state.rc == 0 and _bridge.host_ip in _vlan_iface_state.stdout
+
+    - name: "Report VLAN subinterface {{ _bridge.name }}.{{ _bridge.host_vlan }}"
+      ansible.builtin.debug:
+        msg: >
+          {{ inventory_hostname }} ({{ pve_node }}):
+          {{ _bridge.name }}.{{ _bridge.host_vlan }} configured with IP
+          {{ _bridge.host_ip }}/24 (VLAN {{ _bridge.host_vlan }}).
+          {% if _bridge.gateway | default('') != '' %}
+          Gateway {{ _bridge.gateway }} set on parent bridge {{ _bridge.name }}.
+          {% endif %}
+
+# ── Case B: IP directly on bridge ────────────────────────────────────────────
+
+- name: "Case B — Assign IP {{ _bridge.host_ip }} directly on bridge {{ _bridge.name }}"
+  when: >-
+    _bridge.host_vlan is not defined or _bridge.host_vlan is none
+  block:
+
+    - name: "Get current config of {{ _bridge.name }} from Proxmox API"
+      ansible.builtin.command: >
+        pvesh get /nodes/{{ pve_node }}/network/{{ _bridge.name }}
+        --output-format json
+      register: _direct_bridge_raw
+      changed_when: false
+      failed_when: false
+
+    - name: "Parse current bridge config"
+      ansible.builtin.set_fact:
+        _direct_bridge_cfg: >-
+          {{ _direct_bridge_raw.stdout | from_json if _direct_bridge_raw.rc == 0 else {} }}
+
+    - name: "Determine if cidr needs updating on {{ _bridge.name }}"
+      ansible.builtin.set_fact:
+        _direct_cidr_current: "{{ _direct_bridge_cfg.get('cidr', '') }}"
+        _direct_cidr_desired: "{{ _bridge.host_ip }}/24"
+        _direct_cidr_needs_change: >-
+          {{ _direct_bridge_cfg.get('cidr', '') != _bridge.host_ip + '/24' }}
+
+    - name: "Update {{ _bridge.name }} cidr to {{ _bridge.host_ip }}/24"
+      ansible.builtin.command: >
+        pvesh set /nodes/{{ pve_node }}/network/{{ _bridge.name }}
+        --type bridge
+        --cidr {{ _bridge.host_ip }}/24
+        {% if _bridge.gateway | default('') != '' %}--gateway {{ _bridge.gateway }}{% endif %}
+      when: _direct_cidr_needs_change | bool
+      register: _direct_bridge_update
+
+    - name: Apply pending network config (bring up IP on {{ _bridge.name }})
+      ansible.builtin.command: pvesh set /nodes/{{ pve_node }}/network
+      when: _direct_bridge_update is defined and _direct_bridge_update.changed
+      changed_when: true
+
+    - name: Wait for network reload (ifreload -a is async)
+      ansible.builtin.pause:
+        seconds: 5
+      when: _direct_bridge_update is defined and _direct_bridge_update.changed
+
+    - name: "Verify {{ _bridge.host_ip }} is visible on {{ _bridge.name }} in kernel"
+      ansible.builtin.command: "ip addr show {{ _bridge.name }}"
+      register: _direct_iface_state
+      changed_when: false
+      failed_when: >-
+        _direct_iface_state.rc != 0 or _bridge.host_ip not in _direct_iface_state.stdout
+      retries: 6
+      delay: 5
+      until: >-
+        _direct_iface_state.rc == 0 and _bridge.host_ip in _direct_iface_state.stdout
+
+    - name: "Report IP assigned directly on {{ _bridge.name }}"
+      ansible.builtin.debug:
+        msg: >
+          {{ inventory_hostname }} ({{ pve_node }}): {{ _bridge.name }} now has
+          IP {{ _bridge.host_ip }}/24.
+          {% if _bridge.gateway | default('') != '' %}
+          Gateway: {{ _bridge.gateway }}.
+          {% endif %}
+          Change applied: {{ _direct_cidr_needs_change | bool }}

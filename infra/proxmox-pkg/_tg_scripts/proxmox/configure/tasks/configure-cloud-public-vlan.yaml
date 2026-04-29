@@ -1,0 +1,85 @@
+---
+# Configure a VLAN subinterface on the Proxmox bridge for cloud_public (VLAN 10) access.
+#
+# Creates vmbr0.10 — a VLAN interface on top of vmbr0 — giving the Proxmox host
+# an IP on the cloud_public VLAN (10.0.10.x/24). This IP is used for:
+#   - Proxmox API access (https://<cloud_public_ip>:8006) from VLAN 10 hosts
+#   - Direct SSH access to the Proxmox host from VLAN 10 (no jump host required)
+#
+# Prerequisites: vmbr0 must already exist and be VLAN-aware (configure-linux-bridge.yaml
+#   and configure-vlan-aware-bridge.yaml must have run first).
+# The switch port must be configured with pxe_host_trunk profile so that
+#   tagged VLAN 10 frames reach the Proxmox host.
+#
+# Input variables (from inventory host vars, set by generate_ansible_inventory):
+#   pve_node            (str) - Proxmox node name (e.g. "ms01-01").
+#   pve_vlan_bridge     (str) - VLAN-aware bridge interface (e.g. "vmbr0").
+#   pve_cloud_public_ip (str) - IP to assign on VLAN 10 (e.g. "10.0.10.116").
+#                               Empty string = skip this task.
+#
+# Idempotent: checks if the VLAN interface already exists in the Proxmox network
+#   config before creating it. Only creates and applies if absent.
+
+- name: "Skip cloud_public VLAN interface (pve_cloud_public_ip not set)"
+  ansible.builtin.debug:
+    msg: "pve_cloud_public_ip is not set for {{ inventory_hostname }} — skipping VLAN 10 subinterface."
+  when: pve_cloud_public_ip == ""
+
+- name: Check if VLAN subinterface already exists
+  ansible.builtin.command: >
+    pvesh get /nodes/{{ pve_node }}/network/{{ pve_vlan_bridge }}.10
+    --output-format json
+  register: _vlan_iface_check
+  changed_when: false
+  failed_when: false
+  when: pve_cloud_public_ip != ""
+
+- name: "{{ pve_vlan_bridge }}.10 already exists — no subinterface creation needed"
+  ansible.builtin.debug:
+    msg: >
+      {{ pve_vlan_bridge }}.10 (VLAN 10) already configured on {{ pve_node }}
+      with IP {{ pve_cloud_public_ip }}.
+  when: pve_cloud_public_ip != "" and _vlan_iface_check.rc == 0
+
+- name: "Create {{ pve_vlan_bridge }}.10 VLAN subinterface for cloud_public ({{ pve_cloud_public_ip }})"
+  ansible.builtin.command: >
+    pvesh create /nodes/{{ pve_node }}/network
+    --iface {{ pve_vlan_bridge }}.10
+    --type vlan
+    --vlan-raw-device {{ pve_vlan_bridge }}
+    --tag 10
+    --cidr {{ pve_cloud_public_ip }}/24
+    --autostart 1
+    --comments "cloud_public VLAN 10 host IP"
+  when: pve_cloud_public_ip != "" and _vlan_iface_check.rc != 0
+  register: _vlan_iface_create
+
+# Apply the pending network config (equivalent to "Apply Configuration" in the Proxmox UI).
+# This runs ifreload -a which brings up the new VLAN interface without dropping SSH.
+- name: Apply pending network config (bring up {{ pve_vlan_bridge }}.10)
+  ansible.builtin.command: pvesh set /nodes/{{ pve_node }}/network
+  when: _vlan_iface_create is defined and _vlan_iface_create.changed
+  changed_when: true
+
+- name: Wait for network reload (ifreload -a is async)
+  ansible.builtin.pause:
+    seconds: 5
+  when: _vlan_iface_create is defined and _vlan_iface_create.changed
+
+- name: Verify {{ pve_vlan_bridge }}.10 is up in kernel
+  ansible.builtin.command: "ip addr show {{ pve_vlan_bridge }}.10"
+  register: _vlan_iface_state
+  changed_when: false
+  failed_when: "_vlan_iface_state.rc != 0 or pve_cloud_public_ip not in _vlan_iface_state.stdout"
+  retries: 6
+  delay: 5
+  until: "_vlan_iface_state.rc == 0 and pve_cloud_public_ip in _vlan_iface_state.stdout"
+  when: pve_cloud_public_ip != ""
+
+- name: Report cloud_public VLAN subinterface
+  ansible.builtin.debug:
+    msg: >
+      {{ inventory_hostname }} ({{ pve_node }}): {{ pve_vlan_bridge }}.10
+      configured with IP {{ pve_cloud_public_ip }}/24 (cloud_public VLAN 10).
+      Proxmox API now reachable at https://{{ pve_cloud_public_ip }}:8006.
+  when: pve_cloud_public_ip != ""

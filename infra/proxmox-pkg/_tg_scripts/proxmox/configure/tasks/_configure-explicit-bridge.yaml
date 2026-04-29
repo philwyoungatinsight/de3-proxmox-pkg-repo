@@ -1,0 +1,85 @@
+---
+# Create a Linux bridge with an explicitly named physical NIC.
+#
+# Used when the bridge NIC is known in advance (not auto-detected from the
+# primary NIC). Unlike configure-linux-bridge.yaml, this task does NOT handle
+# systemd-networkd masking or rebooting — the host is expected to already be
+# in ifupdown2 mode (iso-installed Proxmox, or networkd already masked and
+# rebooted by a prior auto-NIC bridge task).
+#
+# Input variables:
+#   _bridge (dict) - bridge descriptor from pve_bridges list:
+#     name      (str) - Bridge interface name (e.g. "vmbr1").
+#     nic       (str) - Physical NIC to attach (e.g. "enp5s0"). Must not be "".
+#     comment   (str) - Free-text comment for the network config entry.
+#   pve_node (str) - Proxmox node name (always available as host var).
+#
+# Idempotent: checks pvesh before creating. Only creates and applies if absent.
+
+# ── 1. Check whether the bridge already exists ────────────────────────────────
+
+- name: "Check if bridge {{ _bridge.name }} exists in Proxmox network config"
+  ansible.builtin.command: >
+    pvesh get /nodes/{{ pve_node }}/network/{{ _bridge.name }}
+    --output-format json
+  register: _eb_check
+  failed_when: false
+  changed_when: false
+
+- name: "Bridge {{ _bridge.name }} already exists — skip creation"
+  ansible.builtin.debug:
+    msg: >
+      Bridge {{ _bridge.name }} is already configured on
+      {{ inventory_hostname }} ({{ pve_node }}). Skipping creation.
+  when: _eb_check.rc == 0
+
+# ── 2. Create the bridge (if absent) ─────────────────────────────────────────
+
+- name: "Create bridge {{ _bridge.name }} with NIC {{ _bridge.nic }}"
+  when: _eb_check.rc != 0
+  block:
+
+    - name: "Create {{ _bridge.name }} bridge (ports={{ _bridge.nic }})"
+      ansible.builtin.command: >
+        pvesh create /nodes/{{ pve_node }}/network
+        --iface {{ _bridge.name }}
+        --type bridge
+        --bridge_ports {{ _bridge.nic }}
+        --autostart 1
+        --comments "{{ _bridge.comment | default('') }}"
+
+    # Strip IP addressing from the NIC that is now a bridge port.
+    - name: "Set {{ _bridge.nic }} to bridge-port only (remove any IP addressing)"
+      ansible.builtin.command: >
+        pvesh set /nodes/{{ pve_node }}/network/{{ _bridge.nic }}
+        --type eth
+        --autostart 1
+      failed_when: false  # OK if the NIC was not yet tracked in pending config
+
+    # Apply both changes. pvesh set /nodes/{node}/network writes interfaces.new
+    # and runs ifreload -a which briefly disconnects SSH (~5–10 s).
+    - name: Apply pending network configuration (triggers ifreload -a)
+      ansible.builtin.command: pvesh set /nodes/{{ pve_node }}/network
+
+    - name: Wait for host to reconnect after network reload
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        timeout: 120
+
+    # ── 3. Verify ─────────────────────────────────────────────────────────────
+
+    - name: "Verify {{ _bridge.name }} bridge now exists in Proxmox config"
+      ansible.builtin.command: >
+        pvesh get /nodes/{{ pve_node }}/network/{{ _bridge.name }}
+        --output-format json
+      register: _eb_verify
+      changed_when: false
+      failed_when: _eb_verify.rc != 0
+
+    - name: "Report {{ _bridge.name }} bridge created"
+      ansible.builtin.debug:
+        msg: |
+          Bridge created on {{ inventory_hostname }} ({{ pve_node }})
+          Bridge : {{ _bridge.name }}
+          Ports  : {{ _bridge.nic }}
+          Comment: {{ _bridge.comment | default('') }}

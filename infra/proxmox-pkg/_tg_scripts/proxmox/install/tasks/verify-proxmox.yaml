@@ -1,0 +1,112 @@
+---
+# Verify Proxmox VE is installed and all services are running.
+#
+# Called by:
+#   - playbook.install-proxmox.yaml (once, after install)
+#   - playbook.install-proxmox-test.yaml (repeatedly via wait_for_condition)
+#
+# All checks use assert so the playbook exits non-zero on any failure.
+# The --test polling loop calls this playbook and retries until it exits 0.
+#
+# Checks:
+#   1. pveversion returns a valid Proxmox version string.
+#   2. pveproxy service is active.
+#   3. pvedaemon service is active.
+#   4. pvestatd service is active.
+#   5. Port 8006 (Proxmox web UI) is reachable.
+
+# ── 1. pveversion ─────────────────────────────────────────────────────────────
+
+- name: Run pveversion
+  ansible.builtin.command: pveversion
+  register: _pveversion
+  failed_when: false
+  changed_when: false
+
+- name: Assert pveversion returns a valid Proxmox version
+  ansible.builtin.assert:
+    that:
+      - _pveversion.rc == 0
+      - "'pve-manager' in _pveversion.stdout"
+    fail_msg: >
+      pveversion failed on {{ inventory_hostname }}.
+      RC={{ _pveversion.rc }}, output={{ _pveversion.stdout | default('(none)') | trim }}
+    success_msg: "pveversion: {{ _pveversion.stdout | trim }}"
+
+# ── 2. pveproxy ──────────────────────────────────────────────────────────────
+
+- name: Get pveproxy service status
+  ansible.builtin.systemd:
+    name: pveproxy
+  register: _pveproxy
+  changed_when: false
+
+- name: Assert pveproxy is active
+  ansible.builtin.assert:
+    that:
+      - _pveproxy.status.ActiveState == "active"
+    fail_msg: "pveproxy is {{ _pveproxy.status.ActiveState }} on {{ inventory_hostname }}"
+    success_msg: "pveproxy is active"
+
+# ── 3. pvedaemon ─────────────────────────────────────────────────────────────
+
+- name: Get pvedaemon service status
+  ansible.builtin.systemd:
+    name: pvedaemon
+  register: _pvedaemon
+  changed_when: false
+
+- name: Assert pvedaemon is active
+  ansible.builtin.assert:
+    that:
+      - _pvedaemon.status.ActiveState == "active"
+    fail_msg: "pvedaemon is {{ _pvedaemon.status.ActiveState }} on {{ inventory_hostname }}"
+    success_msg: "pvedaemon is active"
+
+# ── 4. pvestatd ──────────────────────────────────────────────────────────────
+
+- name: Get pvestatd service status
+  ansible.builtin.systemd:
+    name: pvestatd
+  register: _pvestatd
+  changed_when: false
+
+- name: Assert pvestatd is active
+  ansible.builtin.assert:
+    that:
+      - _pvestatd.status.ActiveState == "active"
+    fail_msg: "pvestatd is {{ _pvestatd.status.ActiveState }} on {{ inventory_hostname }}"
+    success_msg: "pvestatd is active"
+
+# ── 5. Port 8006 ─────────────────────────────────────────────────────────────
+
+- name: Check Proxmox web UI port 8006 is listening
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: 8006
+    timeout: 15
+    state: started
+  delegate_to: localhost
+  become: false
+  register: _port_8006
+  failed_when: false
+
+- name: Assert port 8006 is reachable
+  ansible.builtin.assert:
+    that:
+      - _port_8006.state == "started"
+    fail_msg: "Port 8006 is NOT reachable on {{ inventory_hostname }} ({{ ansible_host }})"
+    success_msg: "Port 8006 is accessible on {{ ansible_host }}:8006"
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+
+- name: Report Proxmox VE verification results
+  ansible.builtin.debug:
+    msg: |
+      Proxmox VE verified on {{ inventory_hostname }} ({{ ansible_host }})
+      Version  : {{ _pveversion.stdout | trim }}
+      pveproxy : {{ _pveproxy.status.ActiveState }}
+      pvedaemon: {{ _pvedaemon.status.ActiveState }}
+      pvestatd : {{ _pvestatd.status.ActiveState }}
+      Port 8006: {{ 'reachable' if _port_8006.state == 'started' else 'unreachable' }}
+      Web UI   : https://{{ ansible_host }}:8006

@@ -1,0 +1,248 @@
+---
+# Ensure a Linux bridge (vmbr0 by default) exists on this Proxmox host.
+#
+# Handles two installation paths:
+#   ISO-installed Proxmox  — installer creates vmbr0 automatically. This task
+#                            is a no-op when the bridge already exists.
+#   Apt-installed Proxmox  — MaaS provisions Debian 12 with a raw NIC + DHCP.
+#                            apt install proxmox-ve does NOT create vmbr0.
+#                            This task detects the primary NIC, converts its
+#                            current IP/gateway to a static config on vmbr0,
+#                            and sets the NIC to a bridge-port (no addressing).
+#
+# After this task, configure-vlan-aware-bridge.yaml can enable VLAN filtering
+# on the bridge for both node types.
+#
+# Input variables (from pve_hosts inventory group):
+#   pve_node         (str) - Proxmox node name (e.g. "pve", "ms01-01").
+#   pve_vlan_bridge  (str) - Bridge interface name (default: "vmbr0").
+#
+# Idempotent: if pve_vlan_bridge already exists in the Proxmox network config,
+# the task exits immediately without making any changes.
+
+# ── 0. Disable systemd-networkd (conflicts with ifupdown2 bridge management) ──
+# On apt-installed Proxmox (Debian trixie genericcloud), systemd-networkd manages
+# the primary NIC via DHCP from cloud-init. This conflicts with Proxmox's ifupdown2
+# management: ifreload cannot take control of an interface managed by networkd, so
+# bridge creation silently fails (vmbr0 stays in /etc/network/interfaces but never
+# appears in the kernel).
+#
+# Solution: MASK (but DO NOT stop) systemd-networkd, then reboot. On the next boot:
+# - networkd is masked → will not start
+# - ifupdown2 reads /etc/network/interfaces → brings up vmbr0 with static IP
+#
+# IMPORTANT: do NOT use `state: stopped` here — stopping networkd releases the
+# DHCP lease and removes the IP from the kernel, dropping SSH before the reboot
+# command can fire.
+
+- name: Check if systemd-networkd is active
+  ansible.builtin.shell: "systemctl is-active systemd-networkd 2>/dev/null || echo inactive"
+  register: _networkd_status
+  changed_when: false
+  failed_when: false
+
+- name: Mask systemd-networkd (prevent it starting after reboot; do NOT stop — stopping drops SSH)
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: false
+    masked: true
+  loop:
+    - systemd-networkd
+    - systemd-networkd-wait-online
+  when: _networkd_status.stdout | trim == 'active'
+
+# reboot_timeout: 600 (10 min) is required for apt-installed Proxmox hosts.
+# After `apt install proxmox-ve`, the FIRST boot takes 6+ minutes:
+#   kernel switch → pve-cluster start → storage init → pveproxy/pvedaemon start.
+# 300s (5 min) is NOT enough and causes Ansible to mark the host UNREACHABLE,
+# skipping all subsequent tasks including vmbr0 creation.
+- name: Reboot to hand network control to ifupdown2 (networkd masked; vmbr0 comes up via ifupdown2)
+  ansible.builtin.reboot:
+    reboot_timeout: 600
+    connect_timeout: 10
+    post_reboot_delay: 30
+    msg: "Rebooting to hand network control from systemd-networkd to ifupdown2"
+  when: _networkd_status.stdout | trim == 'active'
+
+# ── 1. Check whether the bridge already exists ────────────────────────────────
+
+- name: Check if {{ pve_vlan_bridge }} bridge exists in Proxmox network config
+  ansible.builtin.command: >
+    pvesh get /nodes/{{ pve_node }}/network/{{ pve_vlan_bridge }}
+    --output-format json
+  register: _bridge_check
+  failed_when: false
+  changed_when: false
+
+- name: "{{ pve_vlan_bridge }} already exists — no bridge creation needed"
+  ansible.builtin.debug:
+    msg: >
+      Bridge {{ pve_vlan_bridge }} is already configured on
+      {{ inventory_hostname }} ({{ pve_node }}). Skipping creation.
+  when: _bridge_check.rc is defined and _bridge_check.rc == 0
+
+# ── 1b. Bridge exists but has no static CIDR (DHCP) — convert to static ────────
+# Apt-installed Proxmox path: Proxmox's apt postinstall creates network.cfg with
+# "vmbr0 inet dhcp" because enp87s0 was in DHCP mode at install time.
+# configure-linux-bridge detects vmbr0 exists (rc == 0) and would normally skip
+# it — but the bridge has no static IP. After the DHCP lease expires (600 s on
+# MaaS provisioning VLAN), the host loses its IP entirely.
+#
+# Fix: if vmbr0 exists but has no cidr field in the Proxmox network config, set
+# it to static using ansible_host (the DHCP-reserved provisioning IP) and the
+# gateway reported by the current DHCP lease. This is safe to run every time
+# because once the cidr is set it will pass the "has static ip" check and skip.
+
+- name: Detect whether existing bridge has a static IP (cidr field present)
+  ansible.builtin.set_fact:
+    _bridge_has_static_ip: >-
+      {{ (_bridge_check.stdout | from_json).get('cidr') | default('') | length > 0 }}
+  when:
+    - _bridge_check.rc is defined and _bridge_check.rc == 0
+    - _bridge_check.stdout | trim | length > 0
+
+- name: "{{ pve_vlan_bridge }} is DHCP-configured — converting to static (apt-installed Proxmox path)"
+  when:
+    - _bridge_check.rc is defined and _bridge_check.rc == 0
+    - not (_bridge_has_static_ip | default(true) | bool)
+  block:
+
+    - name: Gather network facts for current DHCP IP and gateway
+      ansible.builtin.setup:
+        gather_subset: ["network"]
+
+    - name: Resolve current gateway from DHCP lease (will become static gateway on vmbr0)
+      ansible.builtin.set_fact:
+        _dhcp_gateway: "{{ ansible_default_ipv4.gateway | default('') }}"
+
+    - name: >
+        Convert {{ pve_vlan_bridge }} from DHCP to static
+        (cidr={{ ansible_host }}/{{ pve_provisioning_prefix | default('24') }},
+        gateway={{ _dhcp_gateway | default('(none)') }})
+      ansible.builtin.command: >
+        pvesh set /nodes/{{ pve_node }}/network/{{ pve_vlan_bridge }}
+        --type bridge
+        --cidr {{ ansible_host }}/{{ pve_provisioning_prefix | default('24') }}
+        {% if _dhcp_gateway != '' %}--gateway {{ _dhcp_gateway }}{% endif %}
+
+    # Apply the pending config — runs ifreload -a which briefly drops SSH.
+    - name: Apply pending network configuration (triggers ifreload -a)
+      ansible.builtin.command: pvesh set /nodes/{{ pve_node }}/network
+
+    - name: Wait for host to reconnect after ifreload
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        timeout: 120
+
+    - name: Verify {{ pve_vlan_bridge }} now has static CIDR
+      ansible.builtin.command: >
+        pvesh get /nodes/{{ pve_node }}/network/{{ pve_vlan_bridge }}
+        --output-format json
+      register: _bridge_static_verify
+      changed_when: false
+      failed_when: >-
+        _bridge_static_verify.rc != 0 or
+        ((_bridge_static_verify.stdout | from_json).get('cidr') | default('') | length == 0)
+
+    - name: Report static bridge configured
+      ansible.builtin.debug:
+        msg: |
+          {{ pve_vlan_bridge }} on {{ inventory_hostname }} ({{ pve_node }}) converted from DHCP to static:
+          IP     : {{ ansible_host }}/{{ pve_provisioning_prefix | default('24') }}
+          Gateway: {{ _dhcp_gateway | default('(none)') }}
+          DHCP lease expiry no longer causes connectivity loss.
+
+# ── 2. Create bridge from primary NIC (apt-install path only) ─────────────────
+
+- name: Create Linux bridge from primary NIC
+  when: _bridge_check.rc is defined and _bridge_check.rc != 0
+  block:
+
+    - name: Gather network facts to detect primary NIC
+      ansible.builtin.setup:
+        gather_subset: ["network"]
+
+    - name: Resolve primary NIC, IP, prefix, and gateway
+      ansible.builtin.set_fact:
+        _primary_nic:     "{{ ansible_default_ipv4.interface }}"
+        _primary_ip:      "{{ ansible_default_ipv4.address }}"
+        _primary_prefix:  "{{ ansible_default_ipv4.prefix }}"
+        _primary_gateway: "{{ ansible_default_ipv4.gateway | default('') }}"
+
+    - name: Assert a physical NIC (not the bridge itself) was detected
+      ansible.builtin.assert:
+        that:
+          - _primary_nic != ''
+          - _primary_nic != pve_vlan_bridge
+        fail_msg: >
+          Cannot create bridge: primary NIC detected as '{{ _primary_nic }}'.
+          Expected a physical interface name, not '{{ pve_vlan_bridge }}'.
+          Check ansible_default_ipv4 facts on {{ inventory_hostname }}.
+
+    - name: >
+        Create {{ pve_vlan_bridge }} bridge on {{ pve_node }}
+        (ports={{ _primary_nic }}, cidr={{ _primary_ip }}/{{ _primary_prefix }})
+      ansible.builtin.command: >
+        pvesh create /nodes/{{ pve_node }}/network
+        --iface {{ pve_vlan_bridge }}
+        --type bridge
+        --bridge_ports {{ _primary_nic }}
+        --autostart 1
+        --cidr {{ _primary_ip }}/{{ _primary_prefix }}
+        {% if _primary_gateway != '' %}--gateway {{ _primary_gateway }}{% endif %}
+
+    # Remove IP addressing from the NIC that is now a bridge port.
+    # pvesh set with --type eth and no --cidr/--gateway strips its addressing.
+    - name: Set {{ _primary_nic }} to bridge-port only (remove IP addressing)
+      ansible.builtin.command: >
+        pvesh set /nodes/{{ pve_node }}/network/{{ _primary_nic }}
+        --type eth
+        --autostart 1
+      failed_when: false  # OK if the NIC was not yet tracked in the pending config
+
+    # Apply both changes. pvesh set /nodes/{node}/network writes interfaces.new
+    # and runs ifreload -a, which briefly disconnects SSH (~5–10 s).
+    - name: Apply pending network configuration (triggers ifreload -a)
+      ansible.builtin.command: pvesh set /nodes/{{ pve_node }}/network
+
+    - name: Wait for host to reconnect after network reload
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        timeout: 120
+
+    - name: Verify {{ pve_vlan_bridge }} bridge is now present in Proxmox config
+      ansible.builtin.command: >
+        pvesh get /nodes/{{ pve_node }}/network/{{ pve_vlan_bridge }}
+        --output-format json
+      changed_when: false
+      register: _bridge_confirm
+
+    # ifreload -a runs async; the bridge may take a few seconds to appear in the
+    # kernel even after SSH reconnects. Retry for up to 60 s.
+    - name: Wait for {{ pve_vlan_bridge }} to appear in kernel (ifreload is async)
+      ansible.builtin.command: "ls /sys/class/net/{{ pve_vlan_bridge }}/bridge/"
+      register: _bridge_kernel
+      failed_when: false
+      changed_when: false
+      retries: 12
+      delay: 5
+      until: _bridge_kernel.rc == 0
+
+    - name: Assert {{ pve_vlan_bridge }} bridge is active in kernel
+      ansible.builtin.assert:
+        that: _bridge_kernel.rc == 0
+        fail_msg: >
+          vmbr0 exists in Proxmox config but is not in the kernel after 60 s.
+          ifreload may have failed. Check /var/log/syslog on {{ inventory_hostname }}.
+        success_msg: "{{ pve_vlan_bridge }} bridge is active in the kernel"
+
+    - name: Report bridge created
+      ansible.builtin.debug:
+        msg: |
+          Bridge created on {{ inventory_hostname }} ({{ pve_node }})
+          Bridge : {{ pve_vlan_bridge }}
+          Ports  : {{ _primary_nic }}
+          IP     : {{ _primary_ip }}/{{ _primary_prefix }} (static, converted from DHCP)
+          Gateway: {{ _primary_gateway | default('(none)') }}
+          Note   : IP is now static at the Proxmox level. Update ansible_host in
+                   pwy-home-lab-pkg.yaml if the IP changes on redeploy.

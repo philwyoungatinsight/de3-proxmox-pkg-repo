@@ -1,0 +1,34 @@
+---
+# Wave test: verify Kairos test VMs (role_test_vm_kairos) are accessible via SSH
+# after vms.proxmox.from-kairos wave completes. Kairos VMs boot from an ISO and perform
+# an enrollment/install process before SSH becomes available; connection failures
+# are reported as warnings rather than hard failures since the enrollment process
+# may still be in progress.
+- name: Verify Kairos test VMs accessible via SSH
+  hosts: test_vm_kairos
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH connection (Kairos enrollment may take several minutes)
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+      register: _ssh_wait
+      ignore_errors: true
+
+    - name: Gather system facts via SSH (skipped if SSH not yet ready)
+      ansible.builtin.gather_facts:
+      when: not _ssh_wait.failed
+
+    - name: Report SSH result (PASS)
+      ansible.builtin.debug:
+        msg: >-
+          PASS: {{ inventory_hostname }} SSH OK
+          ({{ ansible_distribution | default('kairos') }} {{ ansible_distribution_version | default('') }},
+          {{ ansible_default_ipv4.address | default(ansible_host) }})
+      when: not _ssh_wait.failed
+
+    - name: Report SSH result (WARN — enrollment may still be in progress)
+      ansible.builtin.debug:
+        msg: >-
+          WARN: {{ inventory_hostname }} SSH not yet available
+          (Kairos enrollment may still be in progress — re-run test once complete)
+      when: _ssh_wait.failed

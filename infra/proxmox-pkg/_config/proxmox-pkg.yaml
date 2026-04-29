@@ -1,0 +1,76 @@
+proxmox-pkg:
+  _provides_capability:
+  - proxmox-pkg: 1.0.0
+  _requires_capability:
+  - unifi-pkg: '>=1.0.0'
+  vars:
+    cloud_public_gateway: 10.0.10.1
+    proxmox_api_port: 8006
+    pve_1_ip: 10.0.10.115
+    pve_2_ip: 10.0.10.200
+  waves:
+  - description: 'Install Proxmox VE on freshly-deployed Debian 13 hosts (ms01-01,
+      ms01-02, ms01-03): adds Proxmox apt repo, installs proxmox-ve and default kernel,
+      reboots, then waits for the PVE API to respond on port 8006. Pre-check verifies
+      SSH reachability via provisioning VLAN. Up to 6 retries with 120s delay between
+      attempts.
+
+      '
+    max_retries: 6
+    name: hypervisor.proxmox.install
+    pre_ansible_playbook: proxmox/proxmox-install-precheck
+    retry_delay_seconds: 120
+    test_ansible_playbook: proxmox/proxmox-install-test
+    update_inventory: true
+  - description: 'Configure ALL Proxmox nodes (pve-1, pve-2, ms01-01, ms01-02, ms01-03):
+      VLAN-aware Linux bridge (vmbr0), cloud_public VLAN 10 subinterface (vmbr0.10),
+      local storage content types, Terraform API token (root@pam!tg-token), and MaaS
+      root SSH key sync so MaaS can reach PVE nodes for power management. Pre-check
+      verifies API 200/401 on all nodes.
+
+      '
+    max_retries: 3
+    name: hypervisor.proxmox.configure
+    pre_ansible_playbook: proxmox/proxmox-configure-precheck
+    retry_delay_seconds: 60
+    test_ansible_playbook: proxmox/proxmox-configure-test
+    update_inventory: true
+  - description: Upload ISOs and cloud-init snippets to pre-existing Proxmox nodes
+      (pve-1, pve-2) that do not require MaaS provisioning. Must run before pxe.*
+      waves so that pve-1 has the Ubuntu cloud image available for utility VM creation
+      (MaaS server, MeshCentral).
+    name: external.proxmox.isos-and-snippets
+    _skip_on_wave_run: true
+    test_action: reapply
+    update_inventory: false
+  - description: 'Upload ISOs and cloud-init snippets to MaaS-provisioned Proxmox
+      nodes (ms01-01). Runs after hypervisor.proxmox.configure once those nodes have
+      Proxmox installed. Uses reapply for idempotency — skips files already present.
+
+      '
+    name: hypervisor.proxmox.storage
+    test_action: reapply
+    update_inventory: false
+  - description: 'Create Ubuntu 24.04 LTS test VMs on pve-1 and pve-2 using the cloud
+      image from hypervisor.proxmox.storage. VMs boot with cloud-init: qemu-guest-agent,
+      SSH key injection, DHCP networking, and hostname DHCP announcement.
+
+      '
+    name: vms.proxmox.from-web.ubuntu
+    test_ansible_playbook: vm/vms-ubuntu-ssh-test
+    update_inventory: true
+  - description: 'Create Rocky Linux 9 and Rocky Linux 10 test VMs on pve-1 using
+      cloud images from hypervisor.proxmox.storage. VMs boot with cloud-init and qemu-guest-agent.
+
+      '
+    name: vms.proxmox.from-web.rocky
+    test_ansible_playbook: vm/vms-rocky-ssh-test
+    update_inventory: true
+  - description: Test VMs built by Packer
+    name: vms.proxmox.from-packer
+    test_ansible_playbook: vm/vms-packer-ssh-test
+    update_inventory: true
+  - description: Test VMs built by Kairos
+    name: vms.proxmox.from-kairos
+    test_ansible_playbook: vm/vms-kairos-ssh-test
+    update_inventory: true

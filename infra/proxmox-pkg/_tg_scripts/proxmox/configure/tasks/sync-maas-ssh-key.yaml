@@ -1,0 +1,38 @@
+---
+# Add the MaaS server root SSH public key to authorized_keys on this PVE host.
+#
+# This allows the MaaS server to SSH directly to Proxmox nodes for monitoring
+# and verification (e.g. system-checks/playbook.check-ms01-ssh.yaml).
+#
+# The key is fetched from hostvars[_maas_server_host]._maas_root_pubkey, which
+# is set by the "Fetch MaaS server root SSH public key" play in the main playbook.
+#
+# Idempotent: lineinfile only inserts the key if it is not already present.
+#
+# Skipped if:
+#   - No maas_server group in inventory (MaaS server not yet deployed)
+#   - MaaS server root has no SSH key (/root/.ssh/id_ed25519.pub absent)
+
+- name: Ensure /root/.ssh exists on this PVE host
+  ansible.builtin.file:
+    path: /root/.ssh
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Ensure /root/.ssh/authorized_keys exists on this PVE host
+  ansible.builtin.file:
+    path: /root/.ssh/authorized_keys
+    state: touch
+    modification_time: preserve
+    access_time: preserve
+
+- name: Add MaaS server root SSH key to authorized_keys (idempotent)
+  vars:
+    _maas_key: "{{ hostvars[_maas_server_host]['_maas_root_pubkey'] | default('') }}"
+  ansible.builtin.lineinfile:
+    path: /root/.ssh/authorized_keys
+    line: "{{ _maas_key }}"
+    state: present
+  when: _maas_key | length > 0

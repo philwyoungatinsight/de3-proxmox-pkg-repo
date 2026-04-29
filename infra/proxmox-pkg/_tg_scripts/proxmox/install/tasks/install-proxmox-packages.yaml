@@ -1,0 +1,427 @@
+---
+# Install Proxmox VE on a fresh Debian 12 (bookworm) or Debian 13 (trixie) host.
+#
+# - Debian 12 (bookworm) → Proxmox VE 8
+# - Debian 13 (trixie)   → Proxmox VE 9
+#
+# Reference: https://pve.proxmox.com/wiki/Install_Proxmox_VE_on_Debian_12_Bookworm
+#
+# Input (from Ansible facts / inventory):
+#   ansible_distribution              - must be "Debian"
+#   ansible_distribution_major_version - must be "12" or "13"
+#   ansible_default_ipv4.address      - host's primary IP (set in /etc/hosts for PVE)
+#   inventory_hostname                - short hostname (used to set /etc/hostname)
+
+# ── Step 1: Verify Debian 12 or 13 ───────────────────────────────────────────
+
+- name: Assert OS is Debian 12 (bookworm) or Debian 13 (trixie)
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution == "Debian"
+      - ansible_distribution_major_version in ["12", "13"]
+    fail_msg: >
+      Proxmox VE requires Debian 12 (bookworm) or Debian 13 (trixie).
+      Found: {{ ansible_distribution }} {{ ansible_distribution_version }}.
+      Ensure deploy_distro: bookworm or trixie is set in pwy-home-lab-pkg.yaml.
+    success_msg: >
+      OS check: {{ ansible_distribution }} {{ ansible_distribution_version }} confirmed
+
+- name: Set Proxmox distro codename
+  ansible.builtin.set_fact:
+    _pve_distro: "{{ 'trixie' if ansible_distribution_major_version == '13' else 'bookworm' }}"
+
+# ── Step 1b: Resize root filesystem to fill partition ────────────────────────
+# Cloud images are deployed with a small filesystem (e.g. 2.8G) regardless of
+# partition size. resize2fs expands an online ext4 filesystem to fill the partition.
+# This is safe on a live mounted filesystem and must happen before package installs.
+
+- name: Check if root filesystem needs expansion
+  ansible.builtin.shell: |
+    root_dev=$(findmnt -n -o SOURCE /)
+    part_size_bytes=$(lsblk -rno SIZE --bytes "$root_dev" 2>/dev/null | head -1)
+    fs_size_bytes=$(tune2fs -l "$root_dev" 2>/dev/null | awk '/Block count:/{blocks=$3} /Block size:/{bs=$3} END{print blocks*bs}')
+    if [ -n "$part_size_bytes" ] && [ -n "$fs_size_bytes" ] && [ "$fs_size_bytes" -lt "$part_size_bytes" ]; then
+      echo "needs_resize"
+    else
+      echo "ok"
+    fi
+  register: _fs_resize_check
+  changed_when: false
+
+- name: Resize root filesystem to fill partition
+  ansible.builtin.command: resize2fs {{ ansible_mounts | selectattr('mount', 'equalto', '/') | map(attribute='device') | first }}
+  when: _fs_resize_check.stdout | trim == 'needs_resize'
+
+# ── Step 2: Mount EFI partition (required before any grub package operations) ──
+# The cloud image may have been deployed with only the root partition in /etc/fstab.
+# Without /boot/efi mounted, grub-cloud-amd64 post-install triggers fail.
+
+- name: Find EFI partition on system disk (vfat partition)
+  ansible.builtin.shell: |
+    # Find the disk hosting the root filesystem
+    root_dev=$(findmnt -n -o SOURCE /)
+    disk=$(lsblk -no PKNAME "$root_dev" 2>/dev/null || echo "")
+    if [ -z "$disk" ]; then
+      exit 0
+    fi
+    # Find vfat (EFI) partition on the same disk.
+    # Use -r (raw) to avoid tree-drawing characters in the NAME column.
+    lsblk -rno NAME,FSTYPE "/dev/$disk" | awk '$2=="vfat"{print "/dev/"$1}' | head -1
+  register: _efi_part
+  changed_when: false
+
+- name: Get EFI partition UUID
+  ansible.builtin.command: "blkid -s UUID -o value {{ _efi_part.stdout | trim }}"
+  register: _efi_uuid
+  changed_when: false
+  when: _efi_part.stdout | trim | length > 0
+
+- name: Add EFI partition to /etc/fstab if missing
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    line: "UUID={{ _efi_uuid.stdout | trim }}  /boot/efi  vfat  umask=0077  0  1"
+    regexp: "^UUID={{ _efi_uuid.stdout | trim }}"
+    state: present
+  when:
+    - _efi_part.stdout | trim | length > 0
+    - _efi_uuid.stdout | default('') | trim | length > 0
+
+- name: Create /boot/efi mountpoint
+  ansible.builtin.file:
+    path: /boot/efi
+    state: directory
+    mode: "0700"
+  when: _efi_part.stdout | trim | length > 0
+
+- name: Mount /boot/efi
+  ansible.posix.mount:
+    path: /boot/efi
+    src: "UUID={{ _efi_uuid.stdout | trim }}"
+    fstype: vfat
+    opts: umask=0077
+    state: mounted
+  when:
+    - _efi_part.stdout | trim | length > 0
+    - _efi_uuid.stdout | default('') | trim | length > 0
+
+- name: Fix any broken dpkg state before proceeding
+  ansible.builtin.command: dpkg --configure -a
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  changed_when: true
+  failed_when: false
+
+# ── Step 3: Set hostname (Proxmox requires a valid hostname, not "localhost") ──
+
+- name: Set system hostname to inventory_hostname
+  ansible.builtin.hostname:
+    name: "{{ inventory_hostname }}"
+  when: ansible_hostname != inventory_hostname
+
+- name: Configure /etc/hosts (Proxmox requires hostname → LAN IP, not loopback)
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: "^127\\.0\\.1\\.1"
+    line: "{{ ansible_default_ipv4.address }}  {{ inventory_hostname }}.pve.local  {{ inventory_hostname }}"
+    state: present
+    backup: true
+
+- name: Verify hostname resolves to non-loopback IP
+  ansible.builtin.command: hostname --ip-address
+  register: _hostname_ip
+  changed_when: false
+  failed_when: _hostname_ip.stdout | trim | regex_search('^127\\.') is not none
+
+# ── Step 3: Proxmox VE GPG key ───────────────────────────────────────────────
+
+- name: Download Proxmox VE GPG key
+  ansible.builtin.get_url:
+    url: "https://enterprise.proxmox.com/debian/proxmox-release-{{ _pve_distro }}.gpg"
+    dest: "/etc/apt/trusted.gpg.d/proxmox-release-{{ _pve_distro }}.gpg"
+    mode: "0644"
+    timeout: 60
+
+# ── Step 4: Proxmox VE apt repository ────────────────────────────────────────
+
+- name: Add Proxmox VE no-subscription apt repository
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/pve-install-repo.list
+    content: |
+      deb [arch=amd64] http://download.proxmox.com/debian/pve {{ _pve_distro }} pve-no-subscription
+    mode: "0644"
+
+- name: Disable Proxmox enterprise subscription repository — traditional format
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/pve-enterprise.list
+    content: |
+      # Disabled: no enterprise subscription key configured.
+      # deb https://enterprise.proxmox.com/debian/pve {{ _pve_distro }} pve-enterprise
+    mode: "0644"
+
+- name: Disable Proxmox enterprise subscription repository — DEB822 format
+  ansible.builtin.lineinfile:
+    path: /etc/apt/sources.list.d/pve-enterprise.sources
+    regexp: "^Enabled:"
+    line: "Enabled: no"
+    insertafter: "^Types:"
+    state: present
+    create: false
+  failed_when: false
+
+# ── Step 4b: Remove MaaS apt proxy and deduplicate sources ────────────────────
+# MaaS curtin deployment installs an apt proxy config (90curtin-aptproxy) that
+# routes all apt traffic through the MaaS server's port 8000 proxy. This blocks
+# Proxmox repo access (401 Unauthorized from the proxy).
+# Debian trixie genericcloud uses debian.sources (DEB822); curtin also writes
+# sources to /etc/apt/sources.list → duplicate warnings. Remove both.
+
+- name: Remove MaaS curtin apt proxy config
+  ansible.builtin.file:
+    path: /etc/apt/apt.conf.d/90curtin-aptproxy
+    state: absent
+
+- name: Check if debian.sources exists (DEB822 format, from genericcloud image)
+  ansible.builtin.stat:
+    path: /etc/apt/sources.list.d/debian.sources
+  register: _debian_sources
+
+- name: Empty /etc/apt/sources.list to avoid duplicate sources with debian.sources
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list
+    content: "# Managed by Ansible; Debian sources are in sources.list.d/debian.sources\n"
+    mode: "0644"
+  when: _debian_sources.stat.exists
+
+# ── Step 5: Update packages and full-upgrade ──────────────────────────────────
+
+- name: Update apt package cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 0
+
+- name: Full-upgrade Debian packages before Proxmox install
+  ansible.builtin.apt:
+    upgrade: full
+    autoremove: true
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+# ── Step 6: Install Proxmox default kernel ────────────────────────────────────
+
+- name: Install Proxmox VE default kernel
+  ansible.builtin.apt:
+    name: proxmox-default-kernel
+    state: present
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  register: _kernel_install
+
+# ── Step 7: Reboot into Proxmox kernel ───────────────────────────────────────
+# Reboot if (a) kernel package was just installed, or (b) running kernel is not
+# a Proxmox kernel (e.g. previous run installed the package but didn't reboot).
+
+- name: Check if running kernel is Proxmox kernel
+  ansible.builtin.shell: uname -r | grep -q '\-pve$' && echo "pve" || echo "other"
+  register: _running_kernel
+  changed_when: false
+
+- name: Reboot to load Proxmox kernel (if package changed or kernel is not PVE)
+  ansible.builtin.reboot:
+    reboot_timeout: 600
+    connect_timeout: 10
+    post_reboot_delay: 30
+    msg: "Rebooting to load Proxmox VE kernel"
+  when: _kernel_install.changed or _running_kernel.stdout | trim == 'other'
+
+# ── Step 8: Install Proxmox VE and required services ─────────────────────────
+
+- name: Install Proxmox VE, postfix, open-iscsi, chrony
+  ansible.builtin.apt:
+    name:
+      - proxmox-ve
+      - postfix
+      - open-iscsi
+      - chrony
+    state: present
+    update_cache: false
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+    # postfix debconf: choose "local only" to avoid interactive configuration prompt
+    DEBCONF_NONINTERACTIVE_SEEN: "true"
+
+# ── Step 9: Remove Debian default kernel ─────────────────────────────────────
+# Proxmox installs its own kernel; the Debian kernel may conflict with GRUB entries.
+
+- name: Remove linux-image-amd64 meta-package (Debian default kernel)
+  ansible.builtin.apt:
+    name: linux-image-amd64
+    state: absent
+    purge: true
+  failed_when: false  # OK if already absent
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+- name: Find installed versioned Debian kernel packages (any version)
+  ansible.builtin.shell: >
+    dpkg-query -W -f='${Package}\n' 'linux-image-[0-9]*' 2>/dev/null || true
+  register: _debian_kernels
+  failed_when: false
+  changed_when: false
+
+- name: Remove versioned Debian kernel packages
+  ansible.builtin.apt:
+    name: "{{ _debian_kernels.stdout_lines }}"
+    state: absent
+    purge: true
+  when: _debian_kernels.stdout_lines | length > 0
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+# ── Step 10: Update GRUB ─────────────────────────────────────────────────────
+
+- name: Update GRUB boot configuration
+  ansible.builtin.command: update-grub
+  changed_when: true
+
+# ── Step 11: Remove os-prober ─────────────────────────────────────────────────
+# Proxmox recommends removing os-prober to prevent GRUB from probing other OS disks.
+
+- name: Remove os-prober (prevents GRUB confusion on Proxmox hosts)
+  ansible.builtin.apt:
+    name: os-prober
+    state: absent
+    purge: true
+  failed_when: false  # OK if not installed
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+# ── Step 12: Ensure Proxmox services are running ──────────────────────────────
+
+- name: Ensure Proxmox services are enabled and started
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+  loop:
+    - pveproxy
+    - pvedaemon
+    - pvestatd
+
+# ── Step 12b: Disable systemd-networkd + write ifupdown2 fallback ────────────
+# Cloud-init Debian images (trixie genericcloud) use systemd-networkd for DHCP.
+# Proxmox uses ifupdown2. Having both active causes ifreload to fail silently
+# when configure-proxmox tries to create vmbr0 (networkd holds the NIC).
+# Mask networkd here so configure-proxmox can create the bridge cleanly.
+#
+# CRITICAL: NEVER use `state: stopped` here. Stopping systemd-networkd releases
+# the DHCP lease and removes the IP from the kernel, immediately dropping the
+# SSH connection. Masking alone is sufficient — configure-proxmox will reboot
+# the host, at which point networkd stays masked and ifupdown2 takes over.
+#
+# IMPORTANT: Replace the primary NIC's "manual" entry in /etc/network/interfaces
+# with "auto + dhcp" so ifupdown2 brings it up with DHCP after the configure-proxmox
+# reboot. Without this, ifupdown2 leaves the NIC down (manual mode) and the machine
+# becomes unreachable until configure-proxmox creates vmbr0.
+#
+# Proxmox's apt postinstall writes /etc/network/interfaces with all NICs as
+# "iface X inet manual". We REPLACE (not append) the primary NIC's line because
+# ifupdown2 uses the FIRST matching "iface" definition — a blockinfile append would
+# add a second "dhcp" definition that is silently ignored by ifupdown2.
+#
+# configure-proxmox's configure-linux-bridge.yaml will later convert this DHCP
+# entry to a static vmbr0 bridge — this entry is only a safety net.
+#
+# SKIP when bridge already has a static IP: On re-runs after configure-proxmox has
+# already converted vmbr0 to static, ansible_default_ipv4.interface = vmbr0 (not the
+# NIC). If we ran the DHCP fallback in that case, we'd find no "iface vmbr0 inet manual"
+# and no "iface vmbr0 inet dhcp" → the else branch would APPEND a duplicate DHCP entry
+# for vmbr0, corrupting /etc/network/interfaces. Skip step 12b when vmbr0 is already static.
+
+- name: Check if bridge already has static IP in /etc/network/interfaces (skip DHCP fallback if so)
+  ansible.builtin.shell: |
+    grep -q "^iface vmbr[0-9]* inet static" /etc/network/interfaces 2>/dev/null \
+      && echo "static" || echo "not_static"
+  register: _bridge_already_static
+  changed_when: false
+  failed_when: false
+
+- name: Gather network facts to detect primary NIC (needed for /etc/network/interfaces)
+  ansible.builtin.setup:
+    gather_subset: ["network"]
+  when: _bridge_already_static.stdout | trim != 'static'
+
+- name: Replace primary NIC's manual entry with auto+dhcp in /etc/network/interfaces
+  ansible.builtin.shell: |
+    NIC="{{ ansible_default_ipv4.interface }}"
+    IFACE_FILE="/etc/network/interfaces"
+    # Replace "iface <NIC> inet manual" with "auto <NIC>\niface <NIC> inet dhcp"
+    # Uses sed -e to handle the multi-line replacement safely.
+    if grep -q "^iface ${NIC} inet manual" "${IFACE_FILE}"; then
+      sed -i "s|^iface ${NIC} inet manual|auto ${NIC}\niface ${NIC} inet dhcp|" "${IFACE_FILE}"
+      echo "Replaced manual → auto+dhcp for ${NIC}"
+    elif grep -q "^auto ${NIC}" "${IFACE_FILE}" && grep -q "^iface ${NIC} inet dhcp" "${IFACE_FILE}"; then
+      echo "DHCP already configured for ${NIC} — no change"
+    else
+      echo "auto ${NIC}" >> "${IFACE_FILE}"
+      echo "iface ${NIC} inet dhcp" >> "${IFACE_FILE}"
+      echo "Appended auto+dhcp for ${NIC} (not found as manual)"
+    fi
+  args:
+    executable: /bin/bash
+  changed_when: true
+  when: _bridge_already_static.stdout | trim != 'static'
+
+- name: Skip DHCP fallback — bridge already has static IP (configure-proxmox has already run)
+  ansible.builtin.debug:
+    msg: >
+      vmbr0 is already configured with a static IP in /etc/network/interfaces.
+      Skipping DHCP NIC fallback to avoid corrupting the bridge port configuration.
+  when: _bridge_already_static.stdout | trim == 'static'
+
+- name: Mask systemd-networkd (prevent restart after reboot; do NOT stop — stopping drops SSH)
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: false
+    masked: true
+  loop:
+    - systemd-networkd
+    - systemd-networkd-wait-online
+  failed_when: false  # OK if service does not exist
+
+# ── Step 13: Report ───────────────────────────────────────────────────────────
+
+- name: Get Proxmox version
+  ansible.builtin.command: pveversion
+  register: _pveversion
+  changed_when: false
+
+# ── Step 14: Enable root SSH access ─────────────────────────────────────────
+# Cloud-init deploys keys for cloud_init_user (e.g. "debian") and places a
+# forced-command entry in root's authorized_keys that rejects root SSH with
+# "Please login as the user 'debian'". Proxmox requires root SSH access for
+# management (configure-proxmox and pve_hosts group use ansible_user=root).
+# Copy clean (no forced command) key from the cloud user to root.
+
+- name: Ensure /root/.ssh exists
+  ansible.builtin.file:
+    path: /root/.ssh
+    state: directory
+    mode: "0700"
+
+- name: Copy cloud user SSH key to root authorized_keys (no forced command)
+  ansible.builtin.shell: |
+    # Extract only plain ssh-* lines (strips cloud-init forced-command prefix)
+    grep '^ssh-' /home/{{ cloud_init_user | default('debian') }}/.ssh/authorized_keys \
+      > /root/.ssh/authorized_keys.new
+    mv /root/.ssh/authorized_keys.new /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+  changed_when: true
+
+- name: Report Proxmox VE installation complete
+  ansible.builtin.debug:
+    msg: |
+      Proxmox VE installed on {{ inventory_hostname }} ({{ ansible_default_ipv4.address }})
+      Version : {{ _pveversion.stdout | trim }}
+      Web UI  : https://{{ ansible_default_ipv4.address }}:8006
+      Login   : root / (system root password)

@@ -1,0 +1,102 @@
+---
+# Verify bridge configuration on a Proxmox host.
+#
+# Iterates pve_bridges and checks each bridge from both the Proxmox API and the
+# kernel. For vlan-aware bridges, asserts that kernel VLAN filtering is active.
+# For OVS bridges, checks that ovs-vsctl lists the bridge. For bridges with a
+# host_ip + host_vlan subinterface, verifies the subinterface exists in the kernel.
+#
+# Input variables (from inventory host vars):
+#   inventory_hostname (str)  - host name for display.
+#   pve_node           (str)  - Proxmox node name (e.g. "pve").
+#   pve_bridges        (list) - list of bridge descriptor dicts (see configure-bridges.yaml).
+
+# ── Per-bridge checks ─────────────────────────────────────────────────────────
+
+- name: "Verify bridge {{ item.name }} (technology={{ item.technology }})"
+  vars:
+    _vb_bridge: "{{ item }}"
+  block:
+
+    - name: "Get {{ item.name }} config from Proxmox API"
+      ansible.builtin.command: >
+        pvesh get /nodes/{{ pve_node }}/network/{{ item.name }}
+        --output-format json
+      register: _vb_api_raw
+      changed_when: false
+      failed_when: _vb_api_raw.rc != 0
+
+    - name: "Parse {{ item.name }} config"
+      ansible.builtin.set_fact:
+        _vb_cfg: "{{ _vb_api_raw.stdout | from_json }}"
+
+    # ── vlan-aware: check kernel VLAN filtering ───────────────────────────────
+
+    - name: "Read kernel VLAN filtering state for {{ item.name }}"
+      ansible.builtin.command: >
+        cat /sys/class/net/{{ item.name }}/bridge/vlan_filtering
+      register: _vb_vlan_filtering
+      changed_when: false
+      failed_when: false
+      when: item.technology == "vlan-aware"
+
+    - name: "Assert VLAN filtering is active on {{ item.name }}"
+      ansible.builtin.assert:
+        that:
+          - _vb_vlan_filtering.stdout | trim == "1"
+        fail_msg: >
+          Bridge {{ item.name }} on {{ inventory_hostname }} does NOT have kernel
+          VLAN filtering enabled. Run './run --build' to configure it.
+        success_msg: "VLAN filtering is active on {{ item.name }}"
+      when: item.technology == "vlan-aware"
+
+    # ── OVS: check ovs-vsctl ─────────────────────────────────────────────────
+
+    - name: "Check OVS bridge {{ item.name }} is present in ovs-vsctl"
+      ansible.builtin.command: ovs-vsctl list-br
+      register: _vb_ovs_brs
+      changed_when: false
+      when: item.technology == "ovs"
+
+    - name: "Assert {{ item.name }} appears in ovs-vsctl list-br"
+      ansible.builtin.assert:
+        that:
+          - item.name in _vb_ovs_brs.stdout
+        fail_msg: >
+          OVS bridge {{ item.name }} on {{ inventory_hostname }} is not listed by
+          ovs-vsctl. Run './run --build' to configure it.
+        success_msg: "OVS bridge {{ item.name }} is present in ovs-vsctl"
+      when: item.technology == "ovs"
+
+    # ── VLAN subinterface: check it exists in kernel ──────────────────────────
+
+    - name: "Check VLAN subinterface {{ item.name }}.{{ item.host_vlan }} exists in kernel"
+      ansible.builtin.command: "ip addr show {{ item.name }}.{{ item.host_vlan }}"
+      register: _vb_vlan_iface
+      changed_when: false
+      failed_when: >-
+        _vb_vlan_iface.rc != 0 or item.host_ip not in _vb_vlan_iface.stdout
+      when:
+        - item.host_ip | default('') != ''
+        - item.host_vlan is defined
+        - item.host_vlan is not none
+
+    # ── Report ────────────────────────────────────────────────────────────────
+
+    - name: "Report {{ item.name }} verification"
+      ansible.builtin.debug:
+        msg: |
+          Host             : {{ inventory_hostname }} ({{ ansible_host }})
+          Node             : {{ pve_node }}
+          Bridge           : {{ item.name }}
+          Technology       : {{ item.technology }}
+          API bridge_vlan_aware : {{ _vb_cfg.get('bridge_vlan_aware', false) }}
+          Kernel vlan_filtering : {{ _vb_vlan_filtering.stdout | trim | default('n/a') if item.technology == 'vlan-aware' else 'n/a (not vlan-aware)' }}
+          Bridge ports     : {{ _vb_cfg.get('bridge_ports', 'n/a') }}
+          Address (bridge) : {{ _vb_cfg.get('cidr', 'n/a') }}
+          Host IP          : {{ item.host_ip | default('(none)') }}
+          Host VLAN        : {{ item.host_vlan | default('(none)') }}
+
+  loop: "{{ pve_bridges }}"
+  loop_control:
+    label: "{{ item.name }}"

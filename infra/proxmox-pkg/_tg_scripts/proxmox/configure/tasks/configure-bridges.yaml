@@ -1,0 +1,93 @@
+---
+# Orchestrate bridge configuration for all bridges declared in pve_bridges.
+#
+# This is the main entry point for bridge setup. It replaces the old flat
+# per-host configure-linux-bridge / configure-vlan-aware-bridge /
+# configure-cloud-public-vlan / configure-ovs-bridge call pattern.
+#
+# Input variables (from inventory host vars):
+#   pve_node    (str)  - Proxmox node name (e.g. "pve", "ms01-01").
+#   pve_bridges (list) - List of bridge descriptor dicts. Each entry:
+#     name        (str)  - Bridge interface name (e.g. "vmbr0", "vmbr1", "ovs0").
+#     nic         (str)  - Physical NIC to attach. "" = auto-detect primary NIC
+#                          (only valid for one bridge per host).
+#     technology  (str)  - "vlan-aware", "linux", or "ovs".
+#     host_ip     (str)  - IP to assign to this bridge on the host. "" = none.
+#     host_vlan   (int|null) - VLAN ID for VLAN subinterface (e.g. 10).
+#                          null/absent = assign IP directly to bridge.
+#     gateway     (str)  - Gateway to configure. "" = do not set/change.
+#     comment     (str)  - Free-text comment stored in the network config.
+#
+# Processing order:
+#   1. Auto-NIC Linux bridges (nic == "") — creates bridge from primary NIC
+#      (configure-linux-bridge.yaml handles networkd masking + reboot).
+#   2. Explicit-NIC Linux bridges (nic != "") — configure-explicit-bridge.yaml.
+#   3. VLAN-aware enablement — for all technology=="vlan-aware" bridges.
+#   4. OVS bridges — for all technology=="ovs" bridges.
+#   5. Host IP assignment — for all bridges with host_ip != "".
+
+# ── Step 1: Auto-NIC Linux/VLAN-aware bridges ─────────────────────────────────
+# configure-linux-bridge.yaml uses pve_vlan_bridge (not _bridge dict), so we
+# pass it as a var override. Handles networkd masking + reboot + bridge creation.
+
+- name: "Step 1 | Configure auto-NIC Linux bridge: {{ item.name }}"
+  ansible.builtin.include_tasks: configure-linux-bridge.yaml
+  vars:
+    pve_vlan_bridge: "{{ item.name }}"
+  loop: "{{ pve_bridges }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when:
+    - item.nic == ""
+    - item.technology in ["vlan-aware", "linux"]
+
+# ── Step 2: Explicit-NIC Linux bridges ────────────────────────────────────────
+# For bridges with an explicitly named NIC (not auto-detected from primary NIC).
+
+- name: "Step 2 | Configure explicit-NIC Linux bridge: {{ item.name }} (nic={{ item.nic }})"
+  ansible.builtin.include_tasks: _configure-explicit-bridge.yaml
+  vars:
+    _bridge: "{{ item }}"
+  loop: "{{ pve_bridges }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when:
+    - item.nic != ""
+    - item.technology in ["vlan-aware", "linux"]
+
+# ── Step 3: Enable VLAN-awareness on all vlan-aware bridges ───────────────────
+# configure-vlan-aware-bridge.yaml only enables VLAN filtering; gateway logic
+# has been removed from that task and is now handled in step 5 below.
+
+- name: "Step 3 | Enable VLAN-aware on bridge: {{ item.name }}"
+  ansible.builtin.include_tasks: configure-vlan-aware-bridge.yaml
+  vars:
+    pve_vlan_bridge: "{{ item.name }}"
+  loop: "{{ pve_bridges }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.technology == "vlan-aware"
+
+# ── Step 4: OVS bridges ───────────────────────────────────────────────────────
+
+- name: "Step 4 | Configure OVS bridge: {{ item.name }}"
+  ansible.builtin.include_tasks: _configure-ovs-bridge.yaml
+  vars:
+    _bridge: "{{ item }}"
+  loop: "{{ pve_bridges }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.technology == "ovs"
+
+# ── Step 5: Assign host IP to bridges that declare one ────────────────────────
+
+- name: "Step 5 | Assign host IP on bridge: {{ item.name }} ({{ item.host_ip }})"
+  ansible.builtin.include_tasks: _configure-bridge-host-ip.yaml
+  vars:
+    _bridge: "{{ item }}"
+  loop: "{{ pve_bridges }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when:
+    - item.host_ip | default('') != ''
+    - item.technology != 'ovs'  # OVS host IP is set via OVSIntPort inside _configure-ovs-bridge.yaml

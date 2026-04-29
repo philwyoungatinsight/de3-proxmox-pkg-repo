@@ -1,0 +1,239 @@
+---
+# Configure an OpenVSwitch (OVS) bridge on a Proxmox host via pvesh.
+#
+# OVS models a managed switch in software, suited for emulating VLAN topologies
+# on a hypervisor without requiring external managed switch configuration.
+#
+# OVS packages are installed automatically if not already present.
+#
+# Input variables:
+#   _bridge (dict) - bridge descriptor from pve_bridges list:
+#     name      (str)      - OVS bridge interface name (e.g. "ovs0").
+#     nic       (str)      - Physical NIC to attach as OVSPort (e.g. "enp5s0f0np0").
+#                           "" = no physical uplink (internal-only bridge).
+#     host_ip   (str)      - IP to assign to an internal OVSIntPort. "" = none.
+#     host_vlan (int|null) - VLAN tag for OVSIntPort. null = untagged.
+#     gateway   (str)      - Gateway for the OVSIntPort. "" = do not set.
+#     comment   (str)      - Free-text comment.
+#   pve_node (str) - Proxmox node name (always available as host var).
+#
+# Idempotent: checks each pvesh resource before creating.
+
+# ── 0. Install OVS packages ───────────────────────────────────────────────────
+# Fully self-contained: installs prerequisite repos and packages per distro.
+#   Debian:       openvswitch-switch + openvswitch-common (main repo — Proxmox VE host OS)
+#   Ubuntu:       openvswitch-switch + openvswitch-common (universe repo, always available)
+#   Rocky Linux:  epel-release (in default Rocky extras repo), then openvswitch from EPEL
+#   RHEL:         CRB repo + EPEL via direct RPM URL (epel-release not in RHEL default repos),
+#                 then openvswitch from EPEL. Requires an active RHEL subscription.
+#
+# Uses ansible_distribution (specific distro name) rather than os_family to be
+# explicit — avoids silently running the wrong path on an unexpected distro.
+#
+# Minimal fact gather — playbook runs with gather_facts: false.
+
+- name: "Gather distribution facts"
+  ansible.builtin.setup:
+    gather_subset:
+      - "!all"
+      - "!min"
+      - distribution
+      - distribution_major_version
+
+- name: "Fail if distro is not supported"
+  ansible.builtin.fail:
+    msg: >
+      OVS package installation is only defined for Debian, Ubuntu, Rocky Linux, and
+      Red Hat Enterprise Linux. Detected: {{ ansible_distribution }}. Add a task block
+      for this distro in tasks/_configure-ovs-bridge.yaml.
+  when: ansible_distribution not in ["Debian", "Ubuntu", "Rocky", "RedHat"]
+
+# ── Debian / Ubuntu ───────────────────────────────────────────────────────────
+# Proxmox VE hosts run Debian; plain managed hosts run Ubuntu.
+# OVS packages ship in the same names on both — openvswitch-switch pulls in
+# openvswitch-common as a dependency, but we list both explicitly.
+# On Debian/Ubuntu the universe/non-free repos are not required; openvswitch is
+# in the main repo for Debian and the universe repo for Ubuntu (enabled by default).
+
+- name: "Install OpenVSwitch packages (Debian/Ubuntu)"
+  ansible.builtin.apt:
+    name:
+      - openvswitch-switch
+      - openvswitch-common
+    state: present
+    update_cache: false
+  when: ansible_distribution in ["Debian", "Ubuntu"]
+
+# ── Rocky Linux ───────────────────────────────────────────────────────────────
+# epel-release is in Rocky's default extras repo — no URL or subscription needed.
+
+- name: "Enable EPEL repo (Rocky Linux)"
+  ansible.builtin.dnf:
+    name: epel-release
+    state: present
+  when: ansible_distribution == "Rocky"
+
+- name: "Install OpenVSwitch package (Rocky Linux — from EPEL)"
+  ansible.builtin.dnf:
+    name: openvswitch
+    state: present
+  when: ansible_distribution == "Rocky"
+
+# ── Red Hat Enterprise Linux ──────────────────────────────────────────────────
+# Requires an active RHEL subscription. Two steps before openvswitch:
+#   1. CodeReady Linux Builder (CRB) — provides build deps that EPEL packages need.
+#      Enabled via dnf config-manager (requires dnf-plugins-core, present by default).
+#   2. EPEL — installed via direct RPM URL since epel-release is not in RHEL default
+#      repos (unlike Rocky). URL is stable across minor versions within a major.
+
+- name: "Enable CodeReady Linux Builder repo (RHEL)"
+  ansible.builtin.command:
+    cmd: dnf config-manager --set-enabled codeready-builder-for-rhel-{{ ansible_distribution_major_version }}-x86_64-rpms
+  register: _rhel_crb
+  changed_when: _rhel_crb.rc == 0
+  when: ansible_distribution == "RedHat"
+
+- name: "Install EPEL release RPM (RHEL)"
+  ansible.builtin.dnf:
+    name: "https://dl.fedoraproject.org/pub/epel/epel-release-latest-{{ ansible_distribution_major_version }}.noarch.rpm"
+    state: present
+    disable_gpg_check: false
+  when: ansible_distribution == "RedHat"
+
+- name: "Install OpenVSwitch package (RHEL — from EPEL)"
+  ansible.builtin.dnf:
+    name: openvswitch
+    state: present
+  when: ansible_distribution == "RedHat"
+
+- name: "Warn: nic is empty — OVS bridge {{ _bridge.name }} will have no physical uplink"
+  ansible.builtin.debug:
+    msg: >
+      Bridge {{ _bridge.name }} has nic: "" — the OVSBridge will be created but
+      no physical NIC will be attached. Run scripts/ai-only-scripts/discover-10g-nics
+      to find the NIC name, set it in bridges[].nic, and re-run to attach the uplink.
+  when: _bridge.nic | default('') == ''
+
+- name: "Initialize OVS change tracker"
+  ansible.builtin.set_fact:
+    _ovs_created: false
+
+# ── 1. OVSBridge ─────────────────────────────────────────────────────────────
+
+- name: "Check if OVSBridge {{ _bridge.name }} already exists"
+  ansible.builtin.command: >
+    pvesh get /nodes/{{ pve_node }}/network/{{ _bridge.name }}
+    --output-format json
+  register: _ovs_bridge_check
+  failed_when: false
+  changed_when: false
+
+- name: "Create OVSBridge {{ _bridge.name }}"
+  ansible.builtin.command: >
+    pvesh create /nodes/{{ pve_node }}/network
+    --iface {{ _bridge.name }}
+    --type OVSBridge
+    --autostart 1
+    --comments "{{ _bridge.comment | default('OVS bridge') }}"
+  when: _ovs_bridge_check.rc != 0
+  register: _ovs_bridge_create
+
+- name: "Mark OVS change: bridge created"
+  ansible.builtin.set_fact:
+    _ovs_created: true
+  when: _ovs_bridge_create is defined and _ovs_bridge_create.changed
+
+# ── 2. OVSPort (physical NIC) ─────────────────────────────────────────────────
+
+- name: "Check if OVSPort {{ _bridge.nic }} already exists"
+  ansible.builtin.command: >
+    pvesh get /nodes/{{ pve_node }}/network/{{ _bridge.nic }}
+    --output-format json
+  register: _ovs_port_check
+  failed_when: false
+  changed_when: false
+  when: _bridge.nic | default('') != ''
+
+- name: "Create OVSPort {{ _bridge.nic }} on bridge {{ _bridge.name }}"
+  ansible.builtin.command: >
+    pvesh create /nodes/{{ pve_node }}/network
+    --iface {{ _bridge.nic }}
+    --type OVSPort
+    --ovs_bridge {{ _bridge.name }}
+    --autostart 1
+  when:
+    - _bridge.nic | default('') != ''
+    - _ovs_port_check.rc != 0
+  register: _ovs_port_create
+
+- name: "Mark OVS change: port created"
+  ansible.builtin.set_fact:
+    _ovs_created: true
+  when: _ovs_port_create is defined and _ovs_port_create.changed
+
+# ── 3. OVSIntPort (host IP) ───────────────────────────────────────────────────
+# The internal port is named <bridge>-host (e.g. "ovs0-host").
+
+- name: "Check if OVSIntPort {{ _bridge.name }}-host already exists"
+  ansible.builtin.command: >
+    pvesh get /nodes/{{ pve_node }}/network/{{ _bridge.name }}-host
+    --output-format json
+  register: _ovs_intport_check
+  failed_when: false
+  changed_when: false
+  when: _bridge.host_ip | default('') != ''
+
+- name: "Create OVSIntPort {{ _bridge.name }}-host (cidr={{ _bridge.host_ip }}/24)"
+  ansible.builtin.command: >
+    pvesh create /nodes/{{ pve_node }}/network
+    --iface {{ _bridge.name }}-host
+    --type OVSIntPort
+    --ovs_bridge {{ _bridge.name }}
+    {% if _bridge.host_vlan is defined and _bridge.host_vlan is not none %}
+    --ovs_tag {{ _bridge.host_vlan }}
+    {% endif %}
+    --cidr {{ _bridge.host_ip }}/24
+    {% if _bridge.gateway | default('') != '' %}--gateway {{ _bridge.gateway }}{% endif %}
+    --autostart 1
+  when:
+    - _bridge.host_ip | default('') != ''
+    - _ovs_intport_check.rc != 0
+  register: _ovs_intport_create
+
+- name: "Mark OVS change: intport created"
+  ansible.builtin.set_fact:
+    _ovs_created: true
+  when: _ovs_intport_create is defined and _ovs_intport_create.changed
+
+# ── 4. Apply and verify ───────────────────────────────────────────────────────
+
+- name: Apply pending OVS network configuration
+  ansible.builtin.command: pvesh set /nodes/{{ pve_node }}/network
+  when: _ovs_created | bool
+  changed_when: true
+
+- name: Wait for OVS network reload
+  ansible.builtin.pause:
+    seconds: 5
+  when: _ovs_created | bool
+
+- name: "Verify OVS bridge {{ _bridge.name }} is visible in ovs-vsctl"
+  ansible.builtin.command: ovs-vsctl list-br
+  register: _ovs_vsctl_out
+  changed_when: false
+  failed_when: _bridge.name not in _ovs_vsctl_out.stdout
+
+- name: "Report OVS bridge {{ _bridge.name }}"
+  ansible.builtin.debug:
+    msg: |
+      OVS bridge configured on {{ inventory_hostname }} ({{ pve_node }})
+      Bridge    : {{ _bridge.name }}
+      NIC port  : {{ _bridge.nic | default('(none)') }}
+      Host IP   : {{ _bridge.host_ip | default('(none)') }}
+      {% if _bridge.host_ip | default('') != '' %}
+      IntPort   : {{ _bridge.name }}-host
+      VLAN tag  : {{ _bridge.host_vlan | default('(untagged)') }}
+      Gateway   : {{ _bridge.gateway | default('(none)') }}
+      {% endif %}
+      Changes applied: {{ _ovs_created | bool }}
+      OVS bridges present: {{ _ovs_vsctl_out.stdout | trim }}

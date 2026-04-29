@@ -1,0 +1,93 @@
+---
+# Ensure the Proxmox API token used by Terragrunt exists with privsep=0.
+#
+# privsep=0 is required: with privsep=1 (the default) the token has no
+# permissions unless explicit ACLs are granted, causing 403 on every API call.
+#
+# Input variables (from inventory host vars, set by generate_ansible_inventory pve_hosts group):
+#   pve_node           (str) - Proxmox node name (e.g. "pve-1").
+#   pve_api_token_id   (str) - Token ID to configure (default: "tg-token").
+#
+# Behaviour:
+#   - Token exists: verifies privsep=0, corrects it if wrong.
+#   - Token missing: creates it with privsep=0, displays the secret prominently.
+#     The secret is shown once and cannot be retrieved later — save it to SOPS.
+
+- name: Check if API token root@pam!{{ pve_api_token_id }} exists
+  ansible.builtin.command: >
+    pvesh get /access/users/root@pam/token/{{ pve_api_token_id }}
+    --output-format json
+  register: _token_check
+  failed_when: false
+  changed_when: false
+
+- name: Parse token info
+  ansible.builtin.set_fact:
+    _token_exists: "{{ _token_check.rc == 0 }}"
+    _token_info: "{{ _token_check.stdout | from_json if _token_check.rc == 0 else {} }}"
+  when: _token_check.rc is defined  # Guard: skip if host was unreachable
+
+- name: Ensure privsep=0 on existing token
+  ansible.builtin.command: >
+    pveum user token modify root@pam {{ pve_api_token_id }} --privsep 0
+  when:
+    - _token_exists is defined
+    - _token_exists
+    - (_token_info.privsep | default(1) | int) != 0
+
+- name: Create API token if missing
+  ansible.builtin.command: >
+    pvesh create /access/users/root@pam/token/{{ pve_api_token_id }}
+    --privsep 0 --comment "for terragrunt" --output-format json
+  register: _token_create
+  when: _token_exists is defined and not _token_exists
+
+- name: Set fact with new token info
+  ansible.builtin.set_fact:
+    _new_token_id: "root@pam!{{ pve_api_token_id }}"
+    _new_token_secret: "{{ (_token_create.stdout | from_json).value }}"
+  when: _token_create is not skipped and _token_create.rc | default(0) == 0
+
+- name: Display new token secret (informational backup)
+  ansible.builtin.debug:
+    msg: |
+      ╔══════════════════════════════════════════════════════════════════╗
+      ║  NEW API TOKEN CREATED                                          ║
+      ║  Token ID : root@pam!{{ pve_api_token_id }}
+      ║  Secret   : {{ _new_token_secret }}
+      ╚══════════════════════════════════════════════════════════════════╝
+  when: _new_token_secret is defined
+
+# SOPS writes must be serialized across hosts to prevent concurrent writes
+# from overwriting each other. throttle: 1 ensures only one host writes at a time.
+# config-mgr set routes via config_source to the deployment package's secrets file.
+- name: Write token ID to SOPS secrets (token.id)
+  ansible.builtin.command: >-
+    {{ lookup('env', '_CONFIG_MGR') }}
+    set {{ pve_config_path }} token.id {{ _new_token_id }} --sops
+  delegate_to: localhost
+  become: false
+  throttle: 1
+  when: _new_token_secret is defined
+
+- name: Write token secret to SOPS secrets (token.secret)
+  ansible.builtin.command: >-
+    {{ lookup('env', '_CONFIG_MGR') }}
+    set {{ pve_config_path }} token.secret {{ _new_token_secret }} --sops
+  delegate_to: localhost
+  become: false
+  throttle: 1
+  when: _new_token_secret is defined
+
+- name: Confirm SOPS write
+  ansible.builtin.debug:
+    msg: "Token written via config-mgr to deployment package secrets at config_params['{{ pve_config_path }}'].token"
+  when: _new_token_secret is defined
+
+- name: Report API token status
+  ansible.builtin.debug:
+    msg: |
+      Host   : {{ inventory_hostname }} (node={{ pve_node }})
+      Token  : root@pam!{{ pve_api_token_id }}
+      Status : {{ 'existed — privsep checked/fixed' if _token_exists else 'created — see secret above' }}
+  when: _token_exists is defined

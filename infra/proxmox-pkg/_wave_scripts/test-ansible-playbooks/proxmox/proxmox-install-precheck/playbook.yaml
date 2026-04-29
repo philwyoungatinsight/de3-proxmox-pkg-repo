@@ -1,0 +1,77 @@
+---
+# Wave pre-check: verify all proxmox_server hosts are reachable via SSH before
+# the on_prem.proxmox.install wave applies.
+#
+# If any host is unreachable, this pre-check FAILS clearly so the run script
+# can handle recovery (e.g. retry_previous_wave_on_failure). The pre-check does
+# NOT attempt to recover or redeploy — that is the job of on_prem.maas.machines.
+
+- name: Load framework config
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Load config_base role
+      ansible.builtin.include_role:
+        name: "{{ lookup('env', '_ANSIBLE_ROLES_DIR') }}/config_base"
+    - name: Capture MaaS config facts
+      ansible.builtin.include_tasks:
+        file: "{{ lookup('env', '_INFRA_DIR') }}/maas-pkg/_tg_scripts/maas/configure-region/tasks/capture-config-fact.yaml"
+
+- name: Check SSH reachability of proxmox_server hosts
+  hosts: proxmox_server
+  gather_facts: false
+  ignore_unreachable: true
+  vars:
+    ansible_connection_timeout: 10
+    ansible_ssh_timeout: 10
+  tasks:
+    - name: Test SSH connectivity (ping)
+      ansible.builtin.ping:
+      register: _ping_result
+      ignore_errors: true
+      timeout: 15
+
+    - name: Record reachability for localhost play
+      ansible.builtin.set_fact:
+        _host_reachable: >-
+          {{ _ping_result is succeeded
+             and not (_ping_result is failed)
+             and not (_ping_result.unreachable | default(false)) }}
+
+- name: Fail if any proxmox_server host is unreachable
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Collect unreachable hosts
+      ansible.builtin.set_fact:
+        _unreachable: >-
+          {%- set result = [] -%}
+          {%- for host in groups.get('proxmox_server', []) -%}
+            {%- if not hostvars.get(host, {}).get('_host_reachable', false) -%}
+              {%- set _ = result.append(host) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ result }}
+
+    - name: Report unreachable hosts
+      ansible.builtin.debug:
+        msg: >
+          UNREACHABLE proxmox_server hosts: {{ _unreachable | join(', ') }}.
+          These hosts need to be deployed before Proxmox can be installed.
+          Re-run the on_prem.maas.machines wave first:
+            ./run -a -w on_prem.maas.machines
+      when: _unreachable | length > 0
+
+    - name: Fail pre-check if any host is unreachable
+      ansible.builtin.fail:
+        msg: >
+          proxmox-install-precheck failed: {{ _unreachable | join(', ') }} unreachable.
+          Run on_prem.maas.machines first to ensure these hosts are deployed.
+      when: _unreachable | length > 0
+
+    - name: Pre-check passed
+      ansible.builtin.debug:
+        msg: "=== proxmox-install-precheck passed — all proxmox_server hosts reachable ==="
+      when: _unreachable | length == 0

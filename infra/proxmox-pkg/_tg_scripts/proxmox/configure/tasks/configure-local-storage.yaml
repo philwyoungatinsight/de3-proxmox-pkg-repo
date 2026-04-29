@@ -1,0 +1,53 @@
+---
+# Ensure the Proxmox local datastore supports the content types required by
+# Terragrunt:
+#   snippets  — cloud-init vendor-data files uploaded by the snippets unit
+#   import    — qcow2 disk images downloaded by the iso-download units
+#
+# Input variables (from inventory host vars, set by generate_ansible_inventory pve_hosts group):
+#   pve_node           (str) - Proxmox node name (e.g. "pve-1").
+#   pve_datastore_iso  (str) - Datastore to configure (default: "local").
+#
+# Idempotent: only calls pvesm set when a type is actually missing.
+
+- name: Get current content types for {{ pve_datastore_iso }}
+  ansible.builtin.command: >
+    pvesh get /storage/{{ pve_datastore_iso }} --output-format json
+  register: _storage_raw
+  changed_when: false
+
+- name: Parse storage content type list
+  ansible.builtin.set_fact:
+    _storage_content_list: >-
+      {{
+        ((_storage_raw.stdout | from_json).get('content', ''))
+        .split(',') | map('trim') | reject('equalto', '') | list
+      }}
+  when: _storage_raw.stdout is defined
+
+- name: Determine which content types are missing
+  ansible.builtin.set_fact:
+    _content_to_add: "{{ ['snippets', 'import'] | difference(_storage_content_list) }}"
+  when: _storage_content_list is defined
+
+- name: Add missing content types to {{ pve_datastore_iso }}
+  ansible.builtin.command: >
+    pvesm set {{ pve_datastore_iso }}
+    --content {{ (_storage_content_list + _content_to_add) | join(',') }}
+  when: _content_to_add is defined and _content_to_add | length > 0
+
+- name: Ensure snippets directory exists
+  ansible.builtin.file:
+    path: /var/lib/vz/snippets
+    state: directory
+    mode: '0755'
+
+- name: Report local storage configuration
+  ansible.builtin.debug:
+    msg: |
+      Host         : {{ inventory_hostname }} (node={{ pve_node }})
+      Datastore    : {{ pve_datastore_iso }}
+      Was          : {{ (_storage_raw.stdout | from_json).get('content', '(none)') }}
+      Added        : {{ _content_to_add | join(', ') | default('(nothing — already complete)', true) }}
+      Result       : {{ (_storage_content_list + _content_to_add) | join(',') }}
+  when: _storage_raw.stdout is defined and _storage_content_list is defined and _content_to_add is defined

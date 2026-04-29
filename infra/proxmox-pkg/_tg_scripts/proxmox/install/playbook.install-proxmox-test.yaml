@@ -1,0 +1,14 @@
+---
+# Verify Proxmox VE is installed and all services are running on proxmox_server hosts.
+#
+# Called by ./run --test (loops until all assertions pass or _PROXMOX_VE_WAIT_TIMEOUT reached).
+# Also called once at the end of ./run --build to confirm a successful install.
+#
+# Run with: ./run --test
+
+- name: Verify Proxmox VE on proxmox_server hosts
+  hosts: proxmox_server
+  gather_facts: false
+  become: true
+  tasks:
+    - ansible.builtin.include_tasks: tasks/verify-proxmox.yaml

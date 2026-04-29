@@ -1,0 +1,84 @@
+---
+# Wave pre-check: verify Proxmox API is reachable on all configured pve nodes
+# before hypervisor.proxmox.configure applies.
+#
+# By the time this runs, hypervisor.proxmox.install has completed, so all
+# newly-installed ms01 nodes should have the Proxmox API up. Pre-existing
+# nodes (pve-1, pve-2) are always expected to be up.
+#
+# If any node's API is unreachable, fail clearly so the operator knows which
+# node needs attention before configuration is attempted.
+
+- name: Load framework config
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Load config_base role
+      ansible.builtin.include_role:
+        name: "{{ lookup('env', '_ANSIBLE_ROLES_DIR') }}/config_base"
+    - name: Build list of pve nodes from config
+      ansible.builtin.set_fact:
+        _pve_nodes: >-
+          {%- set nodes = [] -%}
+          {%- set params = _tg_providers.proxmox.config_params | default({}) -%}
+          {%- for path, cfg in params.items() -%}
+            {%- if cfg is mapping and cfg.get('ansible_host') and '/pve-nodes/' in path -%}
+              {%- set name = path.split('/pve-nodes/')[-1] -%}
+              {%- if '/' not in name -%}
+                {%- set _ = nodes.append({
+                    'label': name,
+                    'host': cfg.ansible_host,
+                    'port': cfg.get('proxmox_api_port', 8006)
+                }) -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ nodes }}
+
+    - name: Report pve nodes to check
+      ansible.builtin.debug:
+        msg: "Checking Proxmox API on: {{ _pve_nodes | map(attribute='label') | list }}"
+
+- name: Verify Proxmox API reachable on all pve nodes (via maas-server)
+  hosts: maas_region
+  gather_facts: false
+  tasks:
+    - name: Check Proxmox API responds 200 or 401 on each node
+      ansible.builtin.uri:
+        url: "https://{{ item.host }}:{{ item.port }}/api2/json/version"
+        method: GET
+        validate_certs: false
+        return_content: false
+        status_code: [200, 401]
+      register: _pve_api_check
+      loop: "{{ hostvars['localhost']['_pve_nodes'] }}"
+      loop_control:
+        label: "{{ item.label }}"
+      retries: 6
+      delay: 10
+      until: _pve_api_check.status in [200, 401]
+      failed_when: false
+
+    - name: Collect unreachable nodes
+      ansible.builtin.set_fact:
+        _unreachable_nodes: >-
+          {{ _pve_api_check.results
+             | selectattr('status', 'not in', [200, 401])
+             | map(attribute='item.label') | list }}
+
+    - name: Fail pre-check if any node is unreachable
+      ansible.builtin.fail:
+        msg: >
+          proxmox-configure-precheck failed: the following pve nodes did not
+          respond to the Proxmox API before hypervisor.proxmox.configure:
+          {{ _unreachable_nodes | join(', ') }}.
+          Re-run hypervisor.proxmox.install to ensure Proxmox is installed
+          and the API is up on all nodes:
+            ./run -a -w hypervisor.proxmox.install
+      when: _unreachable_nodes | length > 0
+
+    - name: Pre-check passed
+      ansible.builtin.debug:
+        msg: "=== proxmox-configure-precheck passed — Proxmox API reachable on all nodes ==="
+      when: _unreachable_nodes | length == 0

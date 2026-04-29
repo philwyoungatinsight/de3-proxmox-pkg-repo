@@ -1,0 +1,58 @@
+---
+# Wave test: verify Proxmox API is reachable on all configured pve nodes.
+#
+# API checks are delegated to maas-region-1 (which has routes to all VLANs,
+# including the provisioning VLAN where ms01-01 lives). Running from localhost
+# would fail for pve nodes on 10.0.12.x (no direct route from the workstation).
+- name: Load framework config
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Load config_base role
+      ansible.builtin.include_role:
+        name: "{{ lookup('env', '_ANSIBLE_ROLES_DIR') }}/config_base"
+    - name: Build list of pve nodes from config
+      ansible.builtin.set_fact:
+        _pve_nodes: >-
+          {%- set nodes = [] -%}
+          {%- set params = _tg_providers.proxmox.config_params | default({}) -%}
+          {%- for path, cfg in params.items() -%}
+            {%- if cfg is mapping and cfg.get('ansible_host') and '/pve-nodes/' in path -%}
+              {%- set name = path.split('/pve-nodes/')[-1] -%}
+              {%- if '/' not in name -%}
+                {%- set _ = nodes.append({
+                    'label': name,
+                    'host': cfg.ansible_host,
+                    'port': cfg.get('proxmox_api_port', 8006)
+                }) -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ nodes }}
+
+- name: Check Proxmox API health for each pve node (via maas-server)
+  hosts: maas_region
+  gather_facts: false
+  tasks:
+    - name: Check Proxmox API health for each pve node
+      ansible.builtin.uri:
+        url: "https://{{ item.host }}:{{ item.port }}/api2/json/version"
+        method: GET
+        validate_certs: false
+        return_content: false
+        status_code: [200, 401]  # 401 = API daemon up but auth required (healthy)
+      register: _pve_responses
+      loop: "{{ hostvars['localhost']['_pve_nodes'] }}"
+      loop_control:
+        label: "{{ item.label }}"
+      retries: 18        # up to 3 min per node — allows for full Proxmox reboot after install
+      delay: 10
+      until: _pve_responses.status in [200, 401]
+
+    - name: Report Proxmox API results
+      ansible.builtin.debug:
+        msg: "PASS: {{ item.item.label }} API OK (HTTP {{ item.status }})"
+      loop: "{{ _pve_responses.results }}"
+      loop_control:
+        label: "{{ item.item.label }}"

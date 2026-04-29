@@ -1,0 +1,28 @@
+---
+# OpenVSwitch (OVS) bridge configuration — planned for pve-2.
+#
+# OVS models a managed switch directly in software, making it well-suited for
+# emulating UniFi VLAN topologies on a hypervisor host. It is planned for pve-2
+# as an experiment before potentially rolling out to pve-1.
+#
+# This task is a stub until OVS is ready to configure.
+#
+# Prerequisites (manual, one-time setup on the target host):
+#   1. Install OVS packages:
+#        apt install openvswitch-switch openvswitch-common
+#   2. In the Proxmox UI, migrate vmbr0 to an OVS bridge type (requires reboot).
+#      See: https://pve.proxmox.com/wiki/Open_vSwitch
+#   3. Update bridge_technology to "ovs" (already set for pve-2 in the YAML).
+#
+# Input variables (from inventory host vars):
+#   inventory_hostname  (str) - host name for display.
+#   pve_node            (str) - Proxmox node name.
+#   pve_vlan_bridge     (str) - OVS bridge interface name.
+
+- name: OVS bridge configuration is not yet implemented
+  ansible.builtin.debug:
+    msg: >
+      OVS bridge configuration for {{ inventory_hostname }} (node={{ pve_node }})
+      is planned but not yet implemented. Install openvswitch-switch on the host,
+      migrate vmbr0 to OVS type in the Proxmox UI, then implement this task.
+      See tasks/configure-ovs-bridge.yaml for prerequisites.
