@@ -74,3 +74,67 @@ proxmox-pkg:
     name: vms.proxmox.from-kairos
     test_ansible_playbook: vm/vms-kairos-ssh-test
     update_inventory: true
+
+  config_params:
+    # ---------------------------------------------------------------------------
+    # Example deployment — illustrates the required config structure.
+    # Copy to your deployment package (e.g. pwy-home-lab-pkg) and set real values.
+    # ---------------------------------------------------------------------------
+
+    # --- proxmox provider examples ---
+    proxmox-pkg/_stack/proxmox/examples-archive:
+      _env: example
+      _provider: proxmox
+      _skip_on_build: true
+      _region: example-lab
+      project_prefix: example
+
+    proxmox-pkg/_stack/proxmox/examples-archive/example-lab:
+      _provider_proxmox_endpoint: https://10.0.10.115:8006   # replace with real PVE endpoint
+
+    proxmox-pkg/_stack/proxmox/examples-archive/example-lab/pve-nodes/pve-1:
+      _unit_purpose: >
+        Example Proxmox VE node. Set node_name, ansible_host, and endpoint to match
+        your physical PVE host. datastore_iso and datastore_vm depend on your storage config.
+      ansible_host: 10.0.10.115   # replace with real PVE host IP
+      ansible_user: root
+      node_name: pve
+      datastore_iso: local
+      datastore_vm: local-zfs
+      network_bridge: vmbr0
+      cloud_init_user: ubuntu
+      cloud_init_ip_address: dhcp
+      agent_enabled: true
+      agent_timeout: 1m
+
+    proxmox-pkg/_stack/proxmox/examples-archive/example-lab/pve-nodes/pve-1/isos/ubuntu-24:
+      _unit_purpose: >
+        Example: download Ubuntu 24.04 cloud image ISO to Proxmox local storage.
+        The file_id output is consumed by VM units that use this image as their disk.
+        Copy to your deployment package and set real node_name and endpoint.
+      _wave: external.proxmox.isos-and-snippets
+
+    proxmox-pkg/_stack/proxmox/examples-archive/example-lab/pve-nodes/pve-1/vms/test/test-ubuntu-vm-1:
+      _unit_purpose: >
+        Example Ubuntu 24.04 cloud image VM on pve-1. Boots with cloud-init and
+        qemu-guest-agent. Copy to your deployment package and set real Proxmox
+        endpoint and credentials.
+      _wave: vms.proxmox.from-web.ubuntu
+      cpu_cores: 2
+      disk_size: 32
+      memory_mb: 2048
+      vm_id: 1001
+
+    # --- null provider examples ---
+    proxmox-pkg/_stack/null/examples-archive:
+      _env: example
+      _provider: "null"
+      _skip_on_build: true
+      _region: example-lab
+
+    proxmox-pkg/_stack/null/examples-archive/example-lab/proxmox/install-proxmox:
+      _unit_purpose: >
+        Example: install Proxmox VE on a freshly MaaS-deployed Debian host.
+        The null_resource runs an Ansible playbook via the proxmox/install tg-script.
+        Requires the host to be reachable via SSH on the provisioning VLAN.
+      _wave: hypervisor.proxmox.install
