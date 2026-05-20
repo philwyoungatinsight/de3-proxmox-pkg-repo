@@ -1,2 +1,7 @@
 _framework:
   main_package: proxmox-pkg
+  labels:
+    - name: _purpose
+      value: Proxmox VE hypervisor provisioning and VM management with UniFi network integration
+    - name: _docs
+      value: https://github.com/philwyoungatinsight/de3-proxmox-pkg-repo
